@@ -22,7 +22,7 @@ lower row:       G15   G13   G9    G8    5VOUT  GND   5VIN
 | Host RX ← C6 TX | G15 (lower row, 7th from right) | D6 (GPIO16) |
 | Host RTS → C6 CTS | G4 (upper row, 2nd from right) | D5 (GPIO23) |
 | Host CTS ← C6 RTS | G6 (upper row, 3rd from right) | D9 (GPIO20). Not D4: see note below |
-| 5 V (planned, not installed yet) | 5VOUT (lower row, 3rd from right), through a Schottky diode | 5V |
+| 5 V | 5VOUT (lower row, 3rd from right), through a Schottky diode | 5V |
 | GND | GND (lower row, 2nd from right) | GND |
 
 The C6 RTS uses D9 (free, because the panel's MISO is not wired). It was on D4 originally and was moved while
@@ -32,7 +32,8 @@ debugging; the real fault turned out to be the Cardputer leaving G6 driven as an
 Watch out: G6 sits directly above 5VOUT, and G4 directly above GND. A wire one row off puts 5 V on a
 C6 pin, which is not 5 V tolerant. Never use 5VIN. The XIAO's 5V pin is wired straight to its USB VBUS,
 so use a Schottky diode (1N5817/SS14, anode at the Cardputer, the band toward the XIAO) or unplug that wire
-while the XIAO is on USB. Until the 5 V wire is installed, the XIAO runs from its own USB port.
+while the XIAO is on USB. With the diode (installed 2026-11-24) the XIAO can stay on USB for flashing and
+logging while the Cardputer powers it.
 
 - UART, 8N1. The baud rate is `SD_LINK_BAUD` in `shared/sd_protocol.h` (default 5 000 000, verified with RTS/CTS and 0 overflows; the `*_2m` build targets are a 2 000 000 fallback).
   Both sides must be built with the same value.

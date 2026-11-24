@@ -40,7 +40,7 @@ lower row:       G15   G13   G9    G8    5VOUT  GND   5VIN
 | G4 | D5 (GPIO23) | Cardputer RTS → C6 CTS |
 | G6 | D9 (GPIO20) | C6 RTS → Cardputer CTS |
 | GND | GND | ground |
-| 5VOUT, through a Schottky diode | 5V | power (**planned**, see below) |
+| 5VOUT, through a Schottky diode | 5V | power (see below) |
 
 Panel (ILI9341 module) on the XIAO: D8 SCK, D10 MOSI (SDI), D0 CS, D1 DC, D2 RESET, D3 backlight (LED), 3V3,
 GND. The panel's MISO (SDO) is not wired.
@@ -48,10 +48,10 @@ GND. The panel's MISO (SDO) is not wired.
 Watch out: G6 sits directly above 5VOUT and G4 directly above GND. A wire one row off puts 5 V on a C6 pin,
 which is not 5 V tolerant. Never use 5VIN.
 
-### Power: the planned 5 V wire
+### Power: the 5 V wire
 
-Today the XIAO is powered from its own USB-C port. The planned final setup powers it from the Cardputer,
-with a wire from **5VOUT** to the XIAO's **5V** pin through a **Schottky diode** (1N5817 or SS14):
+The XIAO is powered from the Cardputer, with a wire from **5VOUT** to the XIAO's **5V** pin through a
+**Schottky diode** (1N5817 or SS14):
 
 ```
 Cardputer 5VOUT ---->|---- XIAO 5V
@@ -64,7 +64,9 @@ logging). That is what made the XIAO drop off USB when a plain wire was tried. T
 only from the Cardputer to the XIAO, so the PC's 5 V never feeds back into the Cardputer. It costs about
 0.3–0.45 V, which the XIAO's 3.3 V regulator does not mind.
 
-This wire is not installed or tested yet. Until it is, keep the XIAO on USB power.
+Installed 2026-11-24. All the tests and measurements in this README (draw_test, stress_test, render_bench,
+tilemap_demo) ran with this wire connected and the XIAO also plugged into USB at the same time: the XIAO stayed
+on USB for flashing and logging, and nothing reset.
 
 ## Building and flashing
 

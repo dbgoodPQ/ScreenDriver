@@ -1,0 +1,7 @@
+# PlatformIO build output and editor state
+.pio/
+.vscode/
+*.pyc
+__pycache__/
+# generated sample art (run tools/make_sample_art.py)
+sample_art/

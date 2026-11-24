@@ -1,0 +1,7 @@
+{
+  "name": "RemoteDisplay",
+  "version": "0.2.0",
+  "description": "Host library for the ScreenDriver ESP32-C6 graphics coprocessor (Cardputer-ADV)",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

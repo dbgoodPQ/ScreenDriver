@@ -1,0 +1,211 @@
+# ScreenDriver link protocol — v1
+
+The Cardputer-ADV (ESP32-S3, the **host**) sends drawing commands to the XIAO ESP32-C6
+(the **coprocessor**). The coprocessor renders them into its 320×240 RGB565
+framebuffer and flushes the changed areas to the ILI9341.
+
+The C/C++ definitions live in `shared/sd_protocol.h`. This document is the reference.
+
+## Physical link
+
+Cardputer-ADV EXT header (2x7), as printed on the board, counted from the right:
+
+```
+                 7th   6th   5th   4th   3rd    2nd   1st (right end)
+upper row:       G5    G39   G14   G40   G6     G4    G3
+lower row:       G15   G13   G9    G8    5VOUT  GND   5VIN
+```
+
+| Signal | Cardputer EXT label (position) | XIAO pin (C6 GPIO) |
+|---|---|---|
+| Host TX → C6 RX | G13 (lower row, 6th from right) | D7 (GPIO17) |
+| Host RX ← C6 TX | G15 (lower row, 7th from right) | D6 (GPIO16) |
+| Host RTS → C6 CTS | G4 (upper row, 2nd from right) | D5 (GPIO23) |
+| Host CTS ← C6 RTS | G6 (upper row, 3rd from right) | D9 (GPIO20). Not D4: see note below |
+| 5 V | 5VOUT (lower row, 3rd from right), through a Schottky diode | 5V |
+| GND | GND (lower row, 2nd from right) | GND |
+
+The C6 RTS uses D9 (free, because the panel's MISO is not wired). It was on D4 originally and was moved while
+debugging; the real fault turned out to be the Cardputer leaving G6 driven as an output (now fixed in
+`SdUartPort::begin`, which resets its input pins), so D4 is most likely fine.
+
+Watch out: G6 sits directly above 5VOUT, and G4 directly above GND. A wire one row off puts 5 V on a
+C6 pin, which is not 5 V tolerant. Never use 5VIN. The XIAO's 5V pin is wired straight to its USB VBUS,
+so use a Schottky diode (1N5817/SS14, anode at the Cardputer) or unplug that wire while the XIAO is on USB.
+
+- UART, 8N1. The baud rate is `SD_LINK_BAUD` in `shared/sd_protocol.h` (default 5 000 000, verified with RTS/CTS and 0 overflows; the `*_2m` build targets are a 2 000 000 fallback).
+  Both sides must be built with the same value.
+- Hardware RTS/CTS flow control is required. The C6 deasserts RTS when its receive
+  buffer is nearly full, so the host never overruns it. No software credit scheme is used.
+
+## Frame format
+
+All multi-byte fields are **little-endian**.
+
+```
++------+------+--------+-----+-----+-------------+--------+
+| 0xA5 | 0x5A | LEN u16| SEQ | CMD | PAYLOAD ... | CRC16  |
++------+------+--------+-----+-----+-------------+--------+
+```
+
+- `LEN` is the number of bytes in `SEQ + CMD + PAYLOAD` (that is, payload length + 2).
+- `SEQ` is a rolling counter from the sender (0–255). Replies echo it where noted.
+- `CRC16` is CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection, no xor-out),
+  computed over `LEN`, `SEQ`, `CMD` and `PAYLOAD`.
+- The maximum payload is **1024 bytes** (`SD_MAX_PAYLOAD`).
+- **Resync:** on a bad CRC or an impossible `LEN`, the receiver drops bytes until it sees
+  the next `0xA5 0x5A` and reports `NACK` with `ERR_CRC`.
+- **Host resync procedure:** if a frame is truncated (for example the host reset mid-frame), the C6
+  parser may sit inside a long body. The host recovers by sending `SD_MAX_PAYLOAD + 8` (or more) zero
+  bytes. That completes the bogus frame, which fails its CRC, and returns the parser to sync search.
+  The host then sends PING.
+- **Boot noise:** the C6 ROM bootloader prints its boot log at 115200 baud on GPIO16, which is our
+  link TX. After the C6 resets, the host sees a short burst of garbage before HELLO. The parser
+  ignores it.
+
+## Types
+
+- `i16` coordinates, which may be negative (they are clipped).
+- `color` is RGB565 as `u16`.
+- `str` is UTF-8 bytes that run to the end of the payload, with no terminator.
+
+## Host → C6 commands
+
+Draw commands are fire-and-forget. Only the commands marked **(reply)** produce a response.
+
+### System (0x00–0x0F)
+
+| Op | Name | Payload |
+|---|---|---|
+| 0x00 | NOP | – |
+| 0x01 | PING **(reply PONG)** | any bytes, which are echoed back |
+| 0x02 | RESET | – (soft-restarts the C6, which then sends HELLO) |
+| 0x03 | INIT | `u8 rotation (0–3)`, `u8 flags` (bit0 = clear screen) |
+| 0x04 | SET_BACKLIGHT | `u8 level (0–255)` |
+| 0x05 | GET_STATUS **(reply STATUS)** | – |
+| 0x0D | DEBUG_HANG | (none). Test only: the C6 loops forever; its 3 s watchdog reboots it and it sends HELLO. |
+| 0x0F | DEBUG_STALL | `u16 ms` (max 2500, below the 3 s watchdog). The C6 stops reading for this long. Test only, used to exercise RTS/CTS. |
+
+### Frame control (0x10–0x1F)
+
+| Op | Name | Payload |
+|---|---|---|
+| 0x10 | BEGIN_FRAME | – |
+| 0x11 | END_FRAME **(reply FRAME_DONE)** | `u8 flags` (bit0 = force full flush) |
+
+Draw commands go into the framebuffer straight away, but nothing reaches the panel until
+`END_FRAME`. Then the dirty rectangles are flushed. Commands sent outside a
+BEGIN/END pair are also flushed at the next `END_FRAME`.
+
+Dirty tracking: each draw adds its bounding box (clipped to the clip rectangle and the screen).
+The C6 keeps up to 16 rectangles, merging overlapping or nearby ones; when the list is full the
+closest pair is merged. If the dirty area exceeds 60 % of the screen, the whole screen is flushed.
+The flush is synchronous: while it runs, RTS holds the host back (no data is lost).
+
+Pacing: `FRAME_DONE` is sent after the flush. The host library keeps at most one frame in flight:
+`endFrame()` waits for the previous frame's `FRAME_DONE` before sending the next `END_FRAME`.
+
+### Drawing state (0x20–0x2F)
+
+| Op | Name | Payload |
+|---|---|---|
+| 0x20 | SET_CLIP | `i16 x, y, w, h` |
+| 0x21 | CLEAR_CLIP | – |
+| 0x22 | SET_TEXT_STYLE | `u8 font`, `u8 size`, `color fg`, `color bg`, `u8 flags` (bit0 = draw bg), `u8 datum` |
+| 0x23 | SET_CURSOR | `i16 x, y` (start position for PRINT) |
+
+`font` IDs: 0 = 6×8 GLCD, 1 = Font2 (16 px), 2 = Font4 (26 px), 3 = Font7 (7-segment),
+4 = FreeSans9pt, 5 = FreeSansBold12pt. `datum` uses the LovyanGFX/M5GFX `textdatum` values: top 0 left / 1 center / 2 right,
+middle 4 / 5 / 6, bottom 8 / 9 / 10, baseline 16 / 17 / 18 (so `MC_DATUM` = 5).
+
+### Primitives (0x30–0x3F)
+
+| Op | Name | Payload |
+|---|---|---|
+| 0x30 | FILL_SCREEN | `color` |
+| 0x31 | FILL_RECT | `i16 x, y, w, h`, `color` |
+| 0x32 | DRAW_RECT | `i16 x, y, w, h`, `color` |
+| 0x33 | DRAW_LINE | `i16 x0, y0, x1, y1`, `color` |
+| 0x34 | DRAW_HLINE | `i16 x, y, w`, `color` |
+| 0x35 | DRAW_VLINE | `i16 x, y, h`, `color` |
+| 0x36 | DRAW_CIRCLE | `i16 x, y, r`, `color` |
+| 0x37 | FILL_CIRCLE | `i16 x, y, r`, `color` |
+| 0x38 | DRAW_ROUND_RECT | `i16 x, y, w, h, r`, `color` |
+| 0x39 | FILL_ROUND_RECT | `i16 x, y, w, h, r`, `color` |
+| 0x3A | DRAW_TRIANGLE | `i16 x0, y0, x1, y1, x2, y2`, `color` |
+| 0x3B | FILL_TRIANGLE | `i16 x0, y0, x1, y1, x2, y2`, `color` |
+| 0x3C | DRAW_PIXELS | `color`, then N × (`i16 x, i16 y`) |
+
+### Text (0x40–0x4F)
+
+| Op | Name | Payload |
+|---|---|---|
+| 0x40 | DRAW_TEXT | `i16 x, y`, `str` (uses the current text style, aligned by its `datum`) |
+| 0x41 | PRINT | `str` at the cursor, console style: a newline byte (0x0A) starts a new line, long lines wrap at the right edge, and the cursor advances. `datum` is ignored. |
+
+### Assets (0x50–0x5F)
+
+Assets are images (sprites or sprite sheets) stored in C6 RAM and referenced by `id`
+(0–63). The pool is 160 KB (HELLO and STATUS report the free bytes). Freeing an asset compacts the
+pool, so it never fragments.
+
+| Op | Name | Payload |
+|---|---|---|
+| 0x50 | ASSET_BEGIN **(reply ACK/NACK)** | `u8 id`, `u8 format`, `u16 w, h`, `u16 frame_w, frame_h`, `color transparent` |
+| 0x51 | ASSET_DATA | `u8 id`, `u32 offset`, raw bytes (NACK only on error) |
+| 0x52 | ASSET_END **(reply ACK/NACK)** | `u8 id` |
+| 0x53 | ASSET_FREE | `u8 id` (0xFF = free all; NACK only on error) |
+
+- `format` is 0 = RGB565. Others are reserved: 1 = 8-bit indexed, 2 = RLE RGB565.
+- A sprite sheet is a `w × h` image split into `frame_w × frame_h` cells, numbered
+  row-major from 0. `frame_w`/`frame_h` = 0 means one frame of the whole image.
+- ASSET_DATA carries the pixels as RGB565 little-endian **in frame order**: all of frame 0 (row by row),
+  then frame 1, and so on. The host library reorders the sheet before sending. `offset` is in bytes.
+- ASSET_BEGIN is refused with `ERR_NO_MEM` if the asset does not fit, and replaces an existing asset with
+  the same id. ASSET_END is refused with `ERR_BAD_ASSET` (and the asset freed) if bytes are missing.
+
+### Blitting (0x60–0x6F)
+
+| Op | Name | Payload |
+|---|---|---|
+| 0x60 | BLIT | `u8 id`, `u16 frame`, `i16 x, y`, `u8 flags` (bit0 = use transparent key, bit1 = flip X, bit2 = flip Y) |
+| 0x61 | BLIT_INLINE | `i16 x, y`, `u16 w, h`, `u8 format`, pixel data (RGB565 LE, row-major; must fit in one frame) |
+| 0x62 | BLIT_EX | `u8 id`, `u16 frame`, `i16 cx, cy` (where the frame's center lands), `i16 angle` (0.1°, clockwise), `i16 scale_x, scale_y` (256 = 1.0, negative = flip), `u8 flags` (bit0 = transparent) |
+
+BLIT on a missing asset gives `ERR_BAD_ASSET`, a frame out of range `ERR_BAD_ARG`.
+
+### Misc (0x70–0x7F)
+
+| Op | Name | Payload |
+|---|---|---|
+| 0x70 | COPY_RECT | `i16 src_x, src_y, w, h, dst_x, dst_y` |
+
+## C6 → host replies (0x80–0x8F)
+
+| Op | Name | Payload |
+|---|---|---|
+| 0x80 | HELLO | `u8 proto_ver`, `u16 fw_ver`, `u16 width, height`, `u32 asset_pool_free` (sent at boot and after RESET; the host must re-send INIT and its assets) |
+| 0x81 | ACK | `u8 acked_seq`, `u8 acked_cmd` |
+| 0x82 | NACK | `u8 seq`, `u8 cmd`, `u8 error` |
+| 0x83 | FRAME_DONE | `u16 frame_no`, `u32 render_us`, `u32 flush_us` |
+| 0x84 | STATUS | `u32 free_heap`, `u32 asset_pool_free`, `u16 fps_x10`, `u32 rx_bytes`, `u32 rx_frames`, `u32 crc_errors`, `u32 len_errors`, `u32 fifo_overflows`, `u32 backpressure` (34 bytes) |
+| 0x85 | PONG | echoed bytes from PING. The header `SEQ` equals the PING's `SEQ`. |
+
+- `rx_frames` counts valid frames, including the GET_STATUS that requested this reply.
+- `fifo_overflows` means the hardware FIFO overflowed and data was lost. It must stay 0.
+- `backpressure` counts the times the C6's receive buffer filled and RTS held the host. This is normal under load and loses no data.
+
+### Error codes
+
+| Code | Name |
+|---|---|
+| 1 | ERR_CRC |
+| 2 | ERR_UNKNOWN_CMD |
+| 3 | ERR_BAD_LEN |
+| 4 | ERR_NO_MEM |
+| 5 | ERR_BAD_ASSET |
+| 6 | ERR_BAD_ARG |
+
+## Versioning
+
+`SD_PROTO_VERSION` is 1. The host compares it against HELLO and refuses to run if they differ.

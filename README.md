@@ -66,7 +66,8 @@ only from the Cardputer to the XIAO, so the PC's 5 V never feeds back into the C
 
 Installed 2026-11-24. All the tests and measurements in this README (draw_test, stress_test, render_bench,
 tilemap_demo) ran with this wire connected and the XIAO also plugged into USB at the same time: the XIAO stayed
-on USB for flashing and logging, and nothing reset.
+on USB for flashing and logging, and nothing reset. With the XIAO's USB unplugged, so the Cardputer is its only
+supply, stress_test passes as well.
 
 ## Building and flashing
 

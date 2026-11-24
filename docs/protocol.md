@@ -33,7 +33,7 @@ Watch out: G6 sits directly above 5VOUT, and G4 directly above GND. A wire one r
 C6 pin, which is not 5 V tolerant. Never use 5VIN. The XIAO's 5V pin is wired straight to its USB VBUS,
 so use a Schottky diode (1N5817/SS14, anode at the Cardputer, the band toward the XIAO) or unplug that wire
 while the XIAO is on USB. With the diode (installed 2026-11-24) the XIAO can stay on USB for flashing and
-logging while the Cardputer powers it.
+logging while the Cardputer powers it, or run on Cardputer power alone (both tested).
 
 - UART, 8N1. The baud rate is `SD_LINK_BAUD` in `shared/sd_protocol.h` (default 5 000 000, verified with RTS/CTS and 0 overflows; the `*_2m` build targets are a 2 000 000 fallback).
   Both sides must be built with the same value.

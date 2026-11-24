@@ -22,7 +22,7 @@ lower row:       G15   G13   G9    G8    5VOUT  GND   5VIN
 | Host RX ← C6 TX | G15 (lower row, 7th from right) | D6 (GPIO16) |
 | Host RTS → C6 CTS | G4 (upper row, 2nd from right) | D5 (GPIO23) |
 | Host CTS ← C6 RTS | G6 (upper row, 3rd from right) | D9 (GPIO20). Not D4: see note below |
-| 5 V | 5VOUT (lower row, 3rd from right), through a Schottky diode | 5V |
+| 5 V (planned, not installed yet) | 5VOUT (lower row, 3rd from right), through a Schottky diode | 5V |
 | GND | GND (lower row, 2nd from right) | GND |
 
 The C6 RTS uses D9 (free, because the panel's MISO is not wired). It was on D4 originally and was moved while
@@ -31,12 +31,14 @@ debugging; the real fault turned out to be the Cardputer leaving G6 driven as an
 
 Watch out: G6 sits directly above 5VOUT, and G4 directly above GND. A wire one row off puts 5 V on a
 C6 pin, which is not 5 V tolerant. Never use 5VIN. The XIAO's 5V pin is wired straight to its USB VBUS,
-so use a Schottky diode (1N5817/SS14, anode at the Cardputer) or unplug that wire while the XIAO is on USB.
+so use a Schottky diode (1N5817/SS14, anode at the Cardputer, the band toward the XIAO) or unplug that wire
+while the XIAO is on USB. Until the 5 V wire is installed, the XIAO runs from its own USB port.
 
 - UART, 8N1. The baud rate is `SD_LINK_BAUD` in `shared/sd_protocol.h` (default 5 000 000, verified with RTS/CTS and 0 overflows; the `*_2m` build targets are a 2 000 000 fallback).
   Both sides must be built with the same value.
-- Hardware RTS/CTS flow control is required. The C6 deasserts RTS when its receive
-  buffer is nearly full, so the host never overruns it. No software credit scheme is used.
+- Hardware RTS/CTS flow control is required. The C6 deasserts RTS when its 128-byte hardware FIFO holds
+  more than 100 bytes (the driver moves data on into a 16 KB receive buffer), so the host never overruns it.
+  No software credit scheme is used.
 
 ## Frame format
 
@@ -80,10 +82,11 @@ Draw commands are fire-and-forget. Only the commands marked **(reply)** produce 
 | 0x00 | NOP | – |
 | 0x01 | PING **(reply PONG)** | any bytes, which are echoed back |
 | 0x02 | RESET | – (soft-restarts the C6, which then sends HELLO) |
-| 0x03 | INIT | `u8 rotation (0–3)`, `u8 flags` (bit0 = clear screen) |
+| 0x03 | INIT | `u8 rotation` (1 or 3: both landscape; others give `ERR_BAD_ARG`), `u8 flags` (bit0 = clear screen) |
 | 0x04 | SET_BACKLIGHT | `u8 level (0–255)` |
 | 0x05 | GET_STATUS **(reply STATUS)** | – |
 | 0x0D | DEBUG_HANG | (none). Test only: the C6 loops forever; its 3 s watchdog reboots it and it sends HELLO. |
+| 0x0E | DEBUG_PINS **(reply PINS)** | `u8 action`. Test only (`link_test`'s wire test): 0/1 = drive the C6 RTS pin (D9) low/high as a plain GPIO, 2 = just read D5, 3/4 = give D9 back to the UART with flow control off/on. Actions 0–2 turn flow control off. |
 | 0x0F | DEBUG_STALL | `u16 ms` (max 2500, below the 3 s watchdog). The C6 stops reading for this long. Test only, used to exercise RTS/CTS. |
 
 ### Frame control (0x10–0x1F)
@@ -100,7 +103,8 @@ BEGIN/END pair are also flushed at the next `END_FRAME`.
 Dirty tracking: each draw adds its bounding box (clipped to the clip rectangle and the screen).
 The C6 keeps up to 16 rectangles, merging overlapping or nearby ones; when the list is full the
 closest pair is merged. If the dirty area exceeds 60 % of the screen, the whole screen is flushed.
-The flush is synchronous: while it runs, RTS holds the host back (no data is lost).
+The flush is synchronous. While it runs, the UART driver keeps receiving into its 16 KB buffer, so the
+next frame's commands arrive meanwhile; RTS holds the host back only if that buffer fills.
 
 Pacing: `FRAME_DONE` is sent after the flush. The host library keeps at most one frame in flight:
 `endFrame()` waits for the previous frame's `FRAME_DONE` before sending the next `END_FRAME`.
@@ -170,26 +174,33 @@ pool, so it never fragments.
   row-major from 0. `frame_w`/`frame_h` = 0 means one frame of the whole image.
 - ASSET_DATA carries the pixels **in frame order**: all of frame 0 (row by row),
   then frame 1, and so on. The host library reorders the sheet before sending. `offset` is in bytes.
-- ASSET_BEGIN is refused with `ERR_NO_MEM` if the asset does not fit, and replaces an existing asset with
-  the same id. ASSET_END is refused with `ERR_BAD_ASSET` (and the asset freed) if bytes are missing.
+- ASSET_BEGIN is refused with `ERR_NO_MEM` if the asset does not fit, with `ERR_BAD_ARG` for an id above 63,
+  an unknown format, a zero size, a palette count outside 1–256 or frames that don't divide the image, and
+  with `ERR_BAD_LEN` if the header is short. It replaces an existing asset with the same id. ASSET_END is refused with `ERR_BAD_ASSET` (and the asset freed) if bytes are missing.
 
 ### Blitting (0x60–0x6F)
 
 | Op | Name | Payload |
 |---|---|---|
 | 0x60 | BLIT | `u8 id`, `u16 frame`, `i16 x, y`, `u8 flags` (bit0 = use transparent key, bit1 = flip X, bit2 = flip Y) |
-| 0x61 | BLIT_INLINE | `i16 x, y`, `u16 w, h`, `u8 format`, pixel data (RGB565 LE, row-major; must fit in one frame) |
+| 0x61 | BLIT_INLINE | `i16 x, y`, `u16 w, h`, `u8 format` (must be 0, RGB565), pixel data (RGB565 LE, row-major; must fit in one frame) |
 | 0x62 | BLIT_EX | `u8 id`, `u16 frame`, `i16 cx, cy` (where the frame's center lands), `i16 angle` (0.1°, clockwise), `i16 scale_x, scale_y` (256 = 1.0, negative = flip), `u8 flags` (bit0 = transparent) |
 | 0x63 | BLIT_BATCH (fw 0600) | 1–127 BLIT payloads (8 bytes each) back to back |
 | 0x64 | DRAW_TILEMAP (fw 0600) | `u8 map`, `u8 tileset`, `i16 scroll_x, scroll_y`, `i16 x, y, w, h` (screen rectangle), `u8 flags` (bit0 = transparent, bit3 = wrap) |
 
-BLIT on a missing asset (or a tilemap) gives `ERR_BAD_ASSET`, a frame out of range `ERR_BAD_ARG`.
-BLIT_BATCH draws every entry and reports the first error, if any.
+BLIT, BLIT_EX and BLIT_BATCH draw RGB565 and INDEXED images alike. A missing asset (or a tilemap) gives
+`ERR_BAD_ASSET`, a frame out of range `ERR_BAD_ARG`. BLIT_BATCH needs a payload length that is a multiple of 8;
+it draws every entry and reports the first error, if any. The host library batches consecutive sprites by
+itself (up to 127 per command).
 
 DRAW_TILEMAP fills the rectangle with the map's tiles; map pixel (`scroll_x`, `scroll_y`) lands at the rectangle's
 top-left. Tile number *n* is frame *n* of the tileset (any image asset, RGB565 or INDEXED); tile 0xFF and numbers
 beyond the tileset's frames are not drawn. Without wrap, the parts of the rectangle outside the map are left
 unchanged; with wrap the map repeats in both directions. The whole rectangle is marked dirty.
+`map` must be a TILEMAP asset and `tileset` an image asset, else `ERR_BAD_ASSET`.
+
+TILE_SET needs a complete TILEMAP asset (`ERR_BAD_ASSET` otherwise); writing outside the map gives
+`ERR_BAD_ARG` and changes nothing.
 
 ### Misc (0x70–0x7F)
 
@@ -207,10 +218,14 @@ unchanged; with wrap the map repeats in both directions. The whole rectangle is 
 | 0x83 | FRAME_DONE | `u16 frame_no`, `u32 render_us`, `u32 flush_us` |
 | 0x84 | STATUS | `u32 free_heap`, `u32 asset_pool_free`, `u16 fps_x10`, `u32 rx_bytes`, `u32 rx_frames`, `u32 crc_errors`, `u32 len_errors`, `u32 fifo_overflows`, `u32 backpressure` (34 bytes) |
 | 0x85 | PONG | echoed bytes from PING. The header `SEQ` equals the PING's `SEQ`. |
+| 0x86 | PINS | `u8 d5_level`, `u8 rts_readback`, `u8 flow_control` (reply to DEBUG_PINS) |
 
 - `rx_frames` counts valid frames, including the GET_STATUS that requested this reply.
 - `fifo_overflows` means the hardware FIFO overflowed and data was lost. It must stay 0.
 - `backpressure` counts the times the C6's receive buffer filled and RTS held the host. This is normal under load and loses no data.
+
+Draw and asset commands without a listed reply answer only on error, with a NACK carrying the command's `SEQ`,
+the command and the error code.
 
 ### Error codes
 
@@ -226,3 +241,7 @@ unchanged; with wrap the map repeats in both directions. The whole rectangle is 
 ## Versioning
 
 `SD_PROTO_VERSION` is 1. The host compares it against HELLO and refuses to run if they differ.
+
+New commands are added without changing the protocol version; HELLO's `fw_ver` says what the C6 supports.
+The host library requires `fw_ver` ≥ `RD_MIN_C6_FW` (0x0600). Firmware 0x0600 added the INDEXED and TILEMAP
+formats, TILE_SET, BLIT_BATCH and DRAW_TILEMAP (marked "fw 0600" above).

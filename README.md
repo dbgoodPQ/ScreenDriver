@@ -20,6 +20,7 @@ the Cardputer's CPU stays almost idle (well under 1 ms per frame in most scenes)
 - `cardputer/`: the `RemoteDisplay` library (`lib/RemoteDisplay`) and example apps (`src/`) (PlatformIO,
   M5Unified/M5Cardputer)
 - `shared/`: protocol definitions and the link layer, used by both sides
+- `examples/extscreen_app/`: a stand-alone app showing how an existing app adds the external screen
 - `docs/protocol.md`: wiring, frame format and every command
 - `tools/make_sample_art.py`: generates the sample art; `tools/readser.py`: records the C6's USB log
 
@@ -109,6 +110,9 @@ copy .pio\build\render_bench\firmware.bin E:\firmwares\screendriver-render-bench
 
 `sprite_demo` and `tilemap_demo` need the sample art in `/screendriver/` on the SD card (see below).
 
+The stand-alone example `examples/extscreen_app` builds on its own (`cd examples/extscreen_app; pio run`) and
+goes to the SD card as `screendriver-extscreen-example.bin`.
+
 Both sides must use the same link speed: `SD_LINK_BAUD` in `shared/sd_protocol.h` (5 000 000). The
 library refuses a C6 with a different protocol version or a firmware older than `RD_MIN_C6_FW` (0x0600).
 
@@ -136,6 +140,25 @@ void loop() {
 ```
 
 Colors are RGB565: M5GFX's `TFT_*` constants and `RemoteDisplay::color565(r, g, b)` work.
+
+### Adding the external screen to an existing app
+
+An app outside this repo uses the library from here. In its `platformio.ini` (forward slashes):
+
+```ini
+lib_deps =
+    ; ... the app's libraries (M5Unified, M5Cardputer, ...) ...
+    symlink://C:/workspaces/ScreenDriver/cardputer/lib/RemoteDisplay
+build_flags =
+    ; ... the app's flags ...
+    -IC:/workspaces/ScreenDriver/shared
+```
+
+(`lib_extern_dirs` does not work with current PlatformIO.) Then call `ext.begin(1, 1500)` after
+`M5Cardputer.begin()` and don't retry it in a loop: without the screen the app runs normally and the library
+connects by itself when the C6 appears. `examples/extscreen_app` is a complete, tested example with two ways
+of using the screen: a second screen with its own content, and a mirror of the Cardputer screen. The link uses
+G13, G15, G4, G6 and UART1, so the app must not use them.
 
 ### Frames
 

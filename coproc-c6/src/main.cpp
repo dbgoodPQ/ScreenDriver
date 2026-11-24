@@ -13,7 +13,7 @@
 static SelfTestResult selfTestResult;
 #endif
 
-#define FW_VERSION 0x0500  // M5
+#define FW_VERSION 0x0600  // M6: palette images, tilemaps, sprite batches
 #define WATCHDOG_MS 3000   // the main loop must come round within this time, or the C6 reboots
 #ifndef ASSET_POOL_BYTES
 #define ASSET_POOL_BYTES (160 * 1024)
@@ -41,6 +41,7 @@ static uint8_t rxBuf[2048];
 
 static struct {
   uint32_t rxBytes = 0, rxFrames = 0, crcErrors = 0, lenErrors = 0, unknownCmds = 0;
+  uint32_t waitUs = 0;  // time the main loop spent waiting for link data (since the last log line)
 } st;
 
 // ---- replies ----------------------------------------------------------------
@@ -164,6 +165,11 @@ static void handleFrame() {
       if (err) sendNack(parser.seq, parser.cmd, err);
       break;
     }
+    case SD_TILE_SET: {
+      uint8_t err = assets.setTiles(p, n);
+      if (err) sendNack(parser.seq, parser.cmd, err);
+      break;
+    }
     case SD_ASSET_FREE: {
       uint8_t err = assets.freeCmd(p, n);
       if (err) sendNack(parser.seq, parser.cmd, err);
@@ -270,6 +276,13 @@ static void logStats() {
   static uint32_t last = 0;
   uint32_t now = millis();
   if (now - last < 2000) return;
+  // link wait per frame: high = the C6 waits for the Cardputer, low = the C6 is the bottleneck
+  static uint16_t lastFrameNo = 0;
+  uint16_t frames = frameNo - lastFrameNo;
+  lastFrameNo = frameNo;
+  if (frames) Serial.printf("[c6] %u frames in %lu ms, link wait %lu us/frame\n", frames, (unsigned long)(now - last),
+                            (unsigned long)(st.waitUs / frames));
+  st.waitUs = 0;
   last = now;
   Serial.printf("[c6] rx=%lu frames=%lu crc=%lu len=%lu line=%lu ovf=%lu bp=%lu cts=%d fc=%s baud=%lu pool=%lu/%lu heap=%lu\n",
                 (unsigned long)st.rxBytes, (unsigned long)st.rxFrames, (unsigned long)st.crcErrors,
@@ -335,7 +348,9 @@ static inline void usbTokenIrqOff() {
 void loop() {
   esp_task_wdt_reset();
   usbTokenIrqOff();
+  uint32_t w0 = micros();
   int n = sdLink.read(rxBuf, sizeof rxBuf, 5);
+  st.waitUs += micros() - w0;
   if (n > 0) {
     st.rxBytes += n;
     processBytes(rxBuf, rxBuf + n);

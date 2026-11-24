@@ -91,7 +91,7 @@ void SdHostLink::onReply() {
         lastNackCmd = p[1];
         lastNackErr = p[2];
         if (p[2] == SD_ERR_CRC) crcNacks++;
-        if (p[2] == SD_ERR_BAD_ASSET && (p[1] == SD_BLIT || p[1] == SD_BLIT_EX)) badAssetNacks++;
+        if (p[2] == SD_ERR_BAD_ASSET && (p[1] == SD_BLIT || p[1] == SD_BLIT_EX || p[1] == SD_BLIT_BATCH || p[1] == SD_DRAW_TILEMAP)) badAssetNacks++;
         if (p[1] == SD_END_FRAME) framesDone++;  // a refused END_FRAME never gets a FRAME_DONE
       }
       break;

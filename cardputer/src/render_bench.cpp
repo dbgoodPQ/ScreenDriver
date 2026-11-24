@@ -1,7 +1,9 @@
-// Milestone 3 render benchmark. Runs timed scenes on the external screen and reports, per scene:
+// Render benchmark (milestones 3-6). Runs timed scenes on the external screen and reports, per scene:
 // frames per second, C6 render and flush time, and the Cardputer's own CPU time per frame
 // (frame time minus the time endFrame() spent waiting for the C6). Any key reruns.
+// Every run is also appended to /screendriver/bench.txt on the SD card (if one is inserted).
 #include "demo_common.h"
+#include <SD.h>
 
 static RemoteDisplay ext;
 
@@ -17,10 +19,28 @@ static inline int rnd(int lo, int hi) {
 
 static uint16_t ball[16 * 16];  // 16x16 sprite made in code (no SD card needed)
 static bool ballReady = false;
+static uint16_t tiles[64 * 16];  // 4 tiles of 16x16
+static uint8_t tmap[40 * 30];
+static bool mapReady = false;
 
 struct Result {
-  float fps, renderMs, flushMs, hostMs;
+  float fps, renderMs, flushMs, hostMs, waitMs;
 };
+
+// Results file on the SD card: opened for each run, closed at its end so the card can be pulled at once
+static const char* LOG_PATH = "/screendriver/bench.txt";
+static File logFile;
+static int runNo = 0;
+
+static void fileLog(const char* fmt, ...) {
+  if (!logFile) return;
+  char s[160];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(s, sizeof s, fmt, ap);
+  va_end(ap);
+  logFile.println(s);
+}
 
 // Runs `frames` frames of a scene and measures them.
 template <typename F>
@@ -44,11 +64,14 @@ static Result runScene(int frames, F drawFrame) {
   r.renderMs = renderSum / 1000.0f / frames;
   r.flushMs = flushSum / 1000.0f / frames;
   r.hostMs = (el - (uint32_t)waitSum) / 1000.0f / frames;
+  r.waitMs = waitSum / 1000.0f / frames;
   return r;
 }
 
 static void report(const char* name, const Result& r) {
   localLog(TFT_WHITE, "%-9s%4.0ffps C6%5.1f+%4.1f CP%5.2f", name, r.fps, r.renderMs, r.flushMs, r.hostMs);
+  fileLog("%-9s fps %5.1f  frame %6.2f ms  C6 render %6.2f flush %6.2f  CP cpu %5.2f wait %6.2f ms", name, r.fps,
+          1000.0f / r.fps, r.renderMs, r.flushMs, r.hostMs, r.waitMs);
 }
 
 static void runAll() {
@@ -57,6 +80,12 @@ static void runAll() {
   localLog(TFT_CYAN, "render bench, times in ms per frame");
 
   localLog(TFT_DARKGREY, "C6 = render+flush, CP = Cardputer CPU");
+  runNo++;
+  if (RemoteDisplay::mountSD()) logFile = SD.open(LOG_PATH, FILE_APPEND);
+  if (!logFile) localLog(TFT_ORANGE, "no SD card: results not saved");
+  fileLog("");
+  fileLog("=== render bench run %d  (uptime %lu s, C6 fw %04X)", runNo, (unsigned long)(millis() / 1000),
+          ext.link().hello.fw);
   // 1. Full-screen redraw every frame (worst case for the panel flush)
   report("full", runScene(60, [](int i) { ext.fillScreen(i & 1 ? TFT_NAVY : TFT_MAROON); }));
 
@@ -116,7 +145,11 @@ static void runAll() {
         int dx = x - 8, dy = y - 8;
         ball[y * 16 + x] = dx * dx + dy * dy < 56 ? RemoteDisplay::color565(40 + x * 12, 200 - y * 8, 255) : RD_KEY_DEFAULT;
       }
+    // id 0: AUTO (stored with a palette, 1 byte per pixel), id 3: the same image as RGB565
     ballReady = ext.uploadImage(0, ball, 16, 16);
+    ext.setImageFormat(RD_FORMAT_RGB565);
+    ballReady = ballReady && ext.uploadImage(3, ball, 16, 16);
+    ext.setImageFormat(RD_FORMAT_AUTO);
     if (!ballReady) localLog(TFT_RED, "sprite upload failed: %s", ext.lastError());
   }
   if (ballReady) {
@@ -124,16 +157,56 @@ static void runAll() {
       ext.fillScreen(TFT_BLACK);
       for (int j = 0; j < 50; ++j) ext.drawSprite(0, 0, (j * 37 + i * 3) % 304, (j * 53 + i * 2) % 224);
     }));
-    report("200 spr", runScene(60, [](int i) {
+    // 200 sprites: palette image in batches of 127 (the default), 16 and 1 (one command each), then RGB565
+    static uint8_t sprId = 0;
+    auto spr200 = [](int i) {
       ext.fillScreen(TFT_BLACK);
-      for (int j = 0; j < 200; ++j) ext.drawSprite(0, 0, (j * 37 + i * 3) % 304, (j * 53 + i * 2) % 224);
-    }));
+      for (int j = 0; j < 200; ++j) ext.drawSprite(sprId, 0, (j * 37 + i * 3) % 304, (j * 53 + i * 2) % 224);
+    };
+    report("200 spr", runScene(60, spr200));
+    ext.setSpriteBatch(16);
+    report("200 b16", runScene(60, spr200));
+    ext.setSpriteBatch(1);
+    report("200 b1", runScene(60, spr200));
+    ext.setSpriteBatch(127);
+    sprId = 3;
+    report("200 565", runScene(60, spr200));
+    sprId = 0;
+  }
+
+  // 8. Tilemap: a full screen of 16x16 tiles (300 tiles), scrolling, in one command per frame
+  if (!mapReady) {
+    const uint16_t tc[4] = {TFT_DARKGREEN, TFT_BROWN, TFT_NAVY, TFT_DARKGREY};
+    for (int t = 0; t < 4; ++t)
+      for (int y = 0; y < 16; ++y)
+        for (int x = 0; x < 16; ++x) tiles[y * 64 + t * 16 + x] = (x == 0 || y == 0) ? TFT_BLACK : tc[t];
+    for (int i = 0; i < 40 * 30; ++i) tmap[i] = (i * 7 + i / 40) % 4;
+    // tileset id 1: AUTO (palette), id 4: RGB565
+    mapReady = ext.uploadImage(1, tiles, 64, 16, 16, 16) && ext.uploadTilemap(2, tmap, 40, 30);
+    ext.setImageFormat(RD_FORMAT_RGB565);
+    mapReady = mapReady && ext.uploadImage(4, tiles, 64, 16, 16, 16);
+    ext.setImageFormat(RD_FORMAT_AUTO);
+    if (!mapReady) localLog(TFT_RED, "tilemap upload failed: %s", ext.lastError());
+  }
+  if (mapReady) {
+    report("tilemap", runScene(60, [](int i) { ext.drawTilemap(2, 1, i * 3, i * 2, 0, 0, 320, 240, RD_WRAP); }));
+    report("tile 565", runScene(60, [](int i) { ext.drawTilemap(2, 4, i * 3, i * 2, 0, 0, 320, 240, RD_WRAP); }));
   }
 
   SdStatusInfo st;
-  if (ext.getStatus(st))
+  if (ext.getStatus(st)) {
     localLog(st.fifoOverflows || st.crcErrors ? TFT_RED : TFT_GREEN, "link: ovf %lu crc %lu bp %lu",
              (unsigned long)st.fifoOverflows, (unsigned long)st.crcErrors, (unsigned long)st.backpressure);
+    fileLog("link: ovf %lu crc %lu bp %lu  C6 heap %lu pool free %lu", (unsigned long)st.fifoOverflows,
+            (unsigned long)st.crcErrors, (unsigned long)st.backpressure, (unsigned long)st.freeHeap,
+            (unsigned long)st.assetFree);
+  } else {
+    fileLog("link: status query failed (%s)", ext.lastError());
+  }
+  if (logFile) {
+    logFile.close();
+    localLog(TFT_GREEN, "saved to %s", LOG_PATH);
+  }
   localLog(TFT_DARKGREY, "any key: rerun");
 }
 

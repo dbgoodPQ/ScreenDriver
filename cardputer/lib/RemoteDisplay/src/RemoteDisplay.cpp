@@ -13,6 +13,7 @@ bool RemoteDisplay::begin(uint8_t rotation, uint32_t timeoutMs) {
     _linkUp = true;
   }
   _pxCount = 0;
+  _blitCount = 0;
   _styleDirty = true;
   _framesSent = 0;
   _link.framesDone = 0;
@@ -66,7 +67,7 @@ bool RemoteDisplay::begin(uint8_t rotation, uint32_t timeoutMs) {
 // ---- low level -----------------------------------------------------------------
 void RemoteDisplay::cmd(uint8_t c, const uint8_t* p, uint16_t n) {
   if (!_connected) return;  // link down: drop drawing, the app keeps running
-  if (_pxCount) flushPixels();
+  flushPending();
   _link.send(c, p, n);
 }
 
@@ -80,6 +81,15 @@ void RemoteDisplay::flushPixels() {
   uint16_t n = _pxCount;
   _pxCount = 0;  // before send(), so cmd() doesn't recurse
   _link.send(SD_DRAW_PIXELS, _px, 2 + n * 4);
+}
+
+void RemoteDisplay::flushBlits() {
+  if (!_blitCount) return;
+  uint16_t n = _blitCount;
+  _blitCount = 0;
+  if (!_connected) return;
+  if (n == 1) _link.send(SD_BLIT, _blit, 8);
+  else _link.send(SD_BLIT_BATCH, _blit, n * 8);
 }
 
 void RemoteDisplay::poll() { checkHealth(); }
@@ -128,6 +138,7 @@ void RemoteDisplay::goDown() {
   _downSinceMs = millis();
   _link.txWaitMs = 0;  // never wait for buffer space while down
   _pxCount = 0;
+  _blitCount = 0;
   _lastProbeMs = 0;
   _probeSeq = -1;
 }
@@ -191,7 +202,7 @@ void RemoteDisplay::startFrame() {
 }
 
 void RemoteDisplay::endFrame(bool fullFlush) {
-  flushPixels();
+  flushPending();
   checkHealth();
   uint32_t now = millis();
   if (!_connected) {  // nothing to send; keep the app's frame rate measurable
@@ -303,6 +314,7 @@ void RemoteDisplay::fillTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
 }
 
 void RemoteDisplay::drawPixel(int16_t x, int16_t y, uint16_t color) {
+  if (_blitCount) flushBlits();  // keep the drawing order
   if (_pxCount && (color != _pxColor || _pxCount == 255)) flushPixels();
   _pxColor = color;
   uint8_t* q = _px + 2 + _pxCount * 4;
@@ -405,7 +417,7 @@ bool RemoteDisplay::getStatus(SdStatusInfo& out, uint32_t timeoutMs) {
 
 // ---- assets (upload part; file loading is in RemoteDisplayImage.cpp) -------------
 uint8_t RemoteDisplay::cmdSeq(uint8_t c, const uint8_t* p, uint16_t n) {
-  if (_pxCount) flushPixels();
+  flushPending();
   return _link.send(c, p, n);
 }
 
@@ -438,9 +450,70 @@ bool RemoteDisplay::waitAck(uint8_t seq, uint32_t timeoutMs) {
   return false;
 }
 
-// Uploads a row-major image/sheet. The C6 wants the frames one after another, so the rows are reordered here.
+// Builds a palette of at most 256 colors and the index of every pixel. False if there are more colors.
+static bool buildPalette(const uint16_t* px, uint32_t n, uint8_t* idx, uint16_t* pal, uint16_t& count) {
+  static uint16_t hkey[1024];
+  static int16_t hval[1024];
+  memset(hval, 0xFF, sizeof hval);  // all -1: empty
+  count = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    uint16_t c = px[i];
+    uint32_t h = ((c * 40503u) >> 6) & 1023;
+    while (hval[h] >= 0 && hkey[h] != c) h = (h + 1) & 1023;
+    if (hval[h] < 0) {
+      if (count == 256) return false;
+      hkey[h] = c;
+      hval[h] = (int16_t)count;
+      pal[count++] = c;
+    }
+    idx[i] = (uint8_t)hval[h];
+  }
+  return true;
+}
+
+// Upload stream: ASSET_BEGIN (answered), then ASSET_DATA in full payloads, then ASSET_END (answered).
+bool RemoteDisplay::beginUpload(const uint8_t* hdr, uint16_t n) {
+  _upId = hdr[0];
+  _upStart = 0;
+  _upFill = 0;
+  return waitAck(cmdSeq(SD_ASSET_BEGIN, hdr, n), 1000);
+}
+
+static uint8_t upChunk[SD_MAX_PAYLOAD];
+static const uint16_t UP_MAX = SD_MAX_PAYLOAD - 5;
+
+void RemoteDisplay::dataPut(const uint8_t* bytes, uint32_t n) {
+  while (n) {
+    uint16_t k = (uint16_t)min<uint32_t>(n, UP_MAX - _upFill);
+    memcpy(upChunk + 5 + _upFill, bytes, k);
+    _upFill += k;
+    bytes += k;
+    n -= k;
+    if (_upFill == UP_MAX) {
+      upChunk[0] = _upId;
+      sd_wr_u32(upChunk + 1, _upStart);
+      _link.send(SD_ASSET_DATA, upChunk, 5 + _upFill);
+      _upStart += _upFill;
+      _upFill = 0;
+    }
+  }
+}
+
+bool RemoteDisplay::endUpload() {
+  if (_upFill) {
+    upChunk[0] = _upId;
+    sd_wr_u32(upChunk + 1, _upStart);
+    _link.send(SD_ASSET_DATA, upChunk, 5 + _upFill);
+    _upStart += _upFill;
+    _upFill = 0;
+  }
+  return waitAck(cmdSeq(SD_ASSET_END, &_upId, 1), 3000);
+}
+
+// Uploads a row-major image/sheet (RGB565 values). The C6 wants the frames one after another, so the rows are
+// reordered here. With at most 256 colors (and format AUTO or INDEXED) it is sent as a palette image.
 bool RemoteDisplay::sendAsset(uint8_t id, const uint16_t* px, uint16_t w, uint16_t h, uint16_t fw, uint16_t fh,
-                              uint16_t key) {
+                              uint16_t key, uint8_t format) {
   if (!_connected) {
     _err = "not connected to the C6";
     return false;
@@ -455,53 +528,137 @@ bool RemoteDisplay::sendAsset(uint8_t id, const uint16_t* px, uint16_t w, uint16
     _err = "image size is not a multiple of the frame size";
     return false;
   }
-  uint8_t b[12], *q = b;
-  *q++ = id;
-  *q++ = SD_FMT_RGB565;
-  q = sd_wr_u16(q, w); q = sd_wr_u16(q, h); q = sd_wr_u16(q, fw); q = sd_wr_u16(q, fh); sd_wr_u16(q, key);
-  if (!waitAck(cmdSeq(SD_ASSET_BEGIN, b, 12), 1000)) return false;
-
-  static uint8_t chunk[SD_MAX_PAYLOAD];
-  const uint16_t maxData = (SD_MAX_PAYLOAD - 5) & ~1;
-  uint32_t start = 0;  // byte offset (in the asset) of the data in chunk
-  uint16_t fill = 0;
-  auto flush = [&]() {
-    if (!fill) return;
-    chunk[0] = id;
-    sd_wr_u32(chunk + 1, start);
-    _link.send(SD_ASSET_DATA, chunk, 5 + fill);
-    start += fill;
-    fill = 0;
-  };
-  const uint16_t cols = w / fw, frames = cols * (h / fh);
-  for (uint16_t f = 0; f < frames; ++f) {
-    const uint16_t* base = px + (uint32_t)(f / cols) * fh * w + (f % cols) * fw;
-    for (uint16_t r = 0; r < fh; ++r) {
-      const uint8_t* row = (const uint8_t*)(base + (uint32_t)r * w);  // RGB565 values: little-endian in memory
-      uint32_t left = fw * 2;
-      while (left) {
-        uint16_t n = (uint16_t)min<uint32_t>(left, maxData - fill);
-        memcpy(chunk + 5 + fill, row, n);
-        fill += n; row += n; left -= n;
-        if (fill == maxData) flush();
-      }
+  // Try a palette
+  uint8_t* idx = nullptr;
+  static uint16_t pal[256];
+  uint16_t palCount = 0;
+  if (format != RD_FORMAT_RGB565) {
+    idx = (uint8_t*)malloc((uint32_t)w * h);
+    if (idx && !buildPalette(px, (uint32_t)w * h, idx, pal, palCount)) {
+      free(idx);
+      idx = nullptr;
+    }
+    if (!idx && format == RD_FORMAT_INDEXED) {
+      _err = "image has more than 256 colors (or no RAM to convert it)";
+      return false;
     }
   }
-  flush();
-  if (!waitAck(cmdSeq(SD_ASSET_END, &id, 1), 3000)) return false;
+  const bool indexed = idx != nullptr;
+  uint16_t keyField = key;
+  if (indexed) {
+    keyField = 0xFFFF;  // the key color isn't used: nothing is transparent
+    for (uint16_t i = 0; i < palCount; ++i)
+      if (pal[i] == key) {
+        keyField = i;
+        break;
+      }
+  }
+
+  uint8_t b[14], *q = b;
+  *q++ = id;
+  *q++ = indexed ? SD_FMT_INDEXED : SD_FMT_RGB565;
+  q = sd_wr_u16(q, w); q = sd_wr_u16(q, h); q = sd_wr_u16(q, fw); q = sd_wr_u16(q, fh); q = sd_wr_u16(q, keyField);
+  if (indexed) sd_wr_u16(q, palCount);
+  bool ok = beginUpload(b, indexed ? 14 : 12);
+  if (ok) {
+    if (indexed) dataPut((const uint8_t*)pal, palCount * 2u);  // RGB565 values: little-endian in memory
+    const uint8_t bpp = indexed ? 1 : 2;
+    const uint8_t* src = indexed ? idx : (const uint8_t*)px;
+    const uint32_t rowBytes = (uint32_t)w * bpp;
+    const uint16_t cols = w / fw, frames = cols * (h / fh);
+    for (uint16_t f = 0; f < frames; ++f) {
+      const uint8_t* base = src + (uint32_t)(f / cols) * fh * rowBytes + (uint32_t)(f % cols) * fw * bpp;
+      for (uint16_t r = 0; r < fh; ++r) dataPut(base + r * rowBytes, (uint32_t)fw * bpp);
+    }
+    ok = endUpload();
+  }
+  free(idx);
+  if (!ok) return false;
 
   Slot& s = _slots[id];
+  s = Slot();
   s.used = true;
   s.mem = px;
-  s.path[0] = 0;
   s.w = w; s.h = h; s.fw = fw; s.fh = fh; s.key = key;
+  s.format = format;
+  s.indexed = indexed;
+  s.palCount = palCount;
   _err = "";
   return true;
 }
 
+bool RemoteDisplay::sendTilemap(uint8_t id, uint8_t* tiles, uint16_t w, uint16_t h) {
+  if (!_connected) {
+    _err = "not connected to the C6";
+    return false;
+  }
+  if (id >= SD_MAX_ASSETS || !tiles || !w || !h) {
+    _err = "bad tilemap id or size";
+    return false;
+  }
+  uint8_t b[12] = {id, SD_FMT_TILEMAP};
+  sd_wr_u16(b + 2, w);
+  sd_wr_u16(b + 4, h);
+  bool ok = beginUpload(b, 12);
+  if (ok) {
+    dataPut(tiles, (uint32_t)w * h);
+    ok = endUpload();
+  }
+  if (!ok) return false;
+  Slot& s = _slots[id];
+  s = Slot();
+  s.used = true;
+  s.map = tiles;
+  s.w = s.fw = w;
+  s.h = s.fh = h;
+  _err = "";
+  return true;
+}
+
+uint32_t RemoteDisplay::assetBytes(uint8_t id) const {
+  if (!hasAsset(id)) return 0;
+  const Slot& s = _slots[id];
+  uint32_t n = s.map ? (uint32_t)s.w * s.h : s.indexed ? s.palCount * 2u + (uint32_t)s.w * s.h : (uint32_t)s.w * s.h * 2;
+  return (n + 3) & ~3u;
+}
+
+bool RemoteDisplay::uploadTilemap(uint8_t id, uint8_t* tiles, uint16_t w, uint16_t h) {
+  return sendTilemap(id, tiles, w, h);
+}
+
+void RemoteDisplay::setTile(uint8_t mapId, uint16_t tx, uint16_t ty, uint8_t tile) {
+  if (!hasAsset(mapId)) return;
+  Slot& s = _slots[mapId];
+  if (!s.map || tx >= s.w || ty >= s.h) return;
+  s.map[(uint32_t)ty * s.w + tx] = tile;  // also kept for restore()
+  uint8_t p[6] = {mapId};
+  sd_wr_u16(p + 1, tx);
+  sd_wr_u16(p + 3, ty);
+  p[5] = tile;
+  cmd(SD_TILE_SET, p, 6);
+}
+
+uint8_t RemoteDisplay::getTile(uint8_t mapId, uint16_t tx, uint16_t ty) const {
+  if (!hasAsset(mapId)) return RD_TILE_EMPTY;
+  const Slot& s = _slots[mapId];
+  if (!s.map || tx >= s.w || ty >= s.h) return RD_TILE_EMPTY;
+  return s.map[(uint32_t)ty * s.w + tx];
+}
+
+void RemoteDisplay::drawTilemap(uint8_t mapId, uint8_t tilesetId, int16_t scrollX, int16_t scrollY, int16_t x,
+                                int16_t y, int16_t w, int16_t h, uint8_t flags) {
+  if (!hasAsset(mapId) || !hasAsset(tilesetId)) return;
+  uint8_t p[15], *q = p;
+  *q++ = mapId;
+  *q++ = tilesetId;
+  q = put16(q, scrollX); q = put16(q, scrollY); q = put16(q, x); q = put16(q, y); q = put16(q, w); q = put16(q, h);
+  *q = flags & (RD_TRANSPARENT | RD_WRAP);
+  cmd(SD_DRAW_TILEMAP, p, 15);
+}
+
 bool RemoteDisplay::uploadImage(uint8_t id, const uint16_t* pixels, uint16_t w, uint16_t h, uint16_t frameW,
                                 uint16_t frameH, uint16_t transparent) {
-  return sendAsset(id, pixels, w, h, frameW, frameH, transparent);
+  return sendAsset(id, pixels, w, h, frameW, frameH, transparent, _imageFormat);
 }
 
 void RemoteDisplay::freeAsset(uint8_t id) {
@@ -535,20 +692,30 @@ bool RemoteDisplay::restoreWithTimeout(uint32_t helloTimeoutMs) {
   for (int id = 0; id < SD_MAX_ASSETS; ++id) {
     Slot s = _slots[id];
     if (!s.used) continue;
-    bool r = s.path[0] ? loadFile(id, s.path, s.fw, s.fh, s.key) : sendAsset(id, s.mem, s.w, s.h, s.fw, s.fh, s.key);
+    bool r = s.map       ? sendTilemap(id, s.map, s.w, s.h)
+             : s.path[0] ? loadFile(id, s.path, s.fw, s.fh, s.key, s.format)
+                         : sendAsset(id, s.mem, s.w, s.h, s.fw, s.fh, s.key, s.format);
     ok = ok && r;
   }
   return ok;
 }
 
 // ---- sprite drawing ------------------------------------------------------------
+void RemoteDisplay::setSpriteBatch(uint8_t n) {
+  flushBlits();  // the queued sprites keep their order
+  _blitLimit = constrain(n, 1, BLIT_MAX - 1);
+}
+
 void RemoteDisplay::drawSprite(uint8_t id, uint16_t frame, int16_t x, int16_t y, uint8_t flags) {
   if (!hasAsset(id)) return;  // never uploaded: a refusal from the C6 now means it lost the asset
-  uint8_t p[8], *q = p;
+  if (!_connected) return;
+  if (_pxCount) flushPixels();  // keep the drawing order
+  if (_blitCount >= _blitLimit) flushBlits();
+  uint8_t* q = _blit + _blitCount * 8;
   *q++ = id;
   q = sd_wr_u16(q, frame); q = put16(q, x); q = put16(q, y);
   *q = flags;
-  cmd(SD_BLIT, p, 8);
+  _blitCount++;
 }
 
 void RemoteDisplay::drawSpriteEx(uint8_t id, uint16_t frame, int16_t cx, int16_t cy, float angleDeg, float scaleX,

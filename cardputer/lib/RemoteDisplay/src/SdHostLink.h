@@ -62,7 +62,7 @@ class SdHostLink {
   uint32_t rxCrcErrors = 0;
   uint32_t rxBytes = 0;  // raw bytes received from the C6, valid or not
   uint32_t crcNacks = 0;       // NACKs with ERR_CRC (a command was lost)
-  uint32_t badAssetNacks = 0;  // NACKs with ERR_BAD_ASSET for BLIT/BLIT_EX (the C6 lost an asset)
+  uint32_t badAssetNacks = 0;  // NACKs with ERR_BAD_ASSET for a sprite/tilemap draw (the C6 lost an asset)
   uint32_t pongCount = 0;
   uint8_t lastPongSeq = 0;
 

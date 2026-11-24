@@ -16,8 +16,8 @@
 #include <functional>
 #include "SdHostLink.h"
 
-// Oldest C6 firmware this library works with (0400 = sprites)
-#define RD_MIN_C6_FW 0x0400
+// Oldest C6 firmware this library works with (0600 = palette images, tilemaps, sprite batches)
+#define RD_MIN_C6_FW 0x0600
 
 enum : uint8_t {
   RD_FONT_GLCD = SD_FONT_GLCD,        // 6x8 pixels
@@ -32,6 +32,12 @@ enum : uint8_t {
 #define RD_TRANSPARENT 0x01  // skip pixels of the asset's transparent color
 #define RD_FLIP_X      0x02
 #define RD_FLIP_Y      0x04
+#define RD_WRAP        0x08  // drawTilemap(): repeat the map in both directions
+#define RD_TILE_EMPTY  0xFF  // a tile number that is never drawn (see-through)
+
+// How images are stored on the C6 (setImageFormat). AUTO: as 8-bit palette images when they have at most 256
+// colors (all pixel art; half the pool space of RGB565), else RGB565.
+enum : uint8_t { RD_FORMAT_AUTO = 0, RD_FORMAT_RGB565 = 1, RD_FORMAT_INDEXED = 2 };
 // Default transparent color: magenta. PNG transparency is mapped to it automatically, so opaque magenta
 // pixels in an image become transparent too.
 #define RD_KEY_DEFAULT 0xF81F
@@ -99,8 +105,10 @@ class RemoteDisplay {
   void println(const char* s = "");
   void printf(const char* fmt, ...) __attribute__((format(printf, 2, 3)));
 
-  // ---- images and sprites (milestone 4)
+  // ---- images and sprites (milestones 4 and 6)
   // Images are uploaded to the C6 once (ids 0..63) and then drawn with tiny commands.
+  // Images with at most 256 colors are stored with a palette (1 byte per pixel), see setImageFormat().
+  void setImageFormat(uint8_t format) { _imageFormat = format; }  // for the following uploads
   // Load a PNG or BMP (16/24-bit) from the SD card. PNG transparency becomes the transparent color.
   // The Cardputer needs w*h*2 bytes of free RAM while loading (about 100 KB max without PSRAM).
   bool loadImage(uint8_t id, const char* path, uint16_t transparent = RD_KEY_DEFAULT);
@@ -116,10 +124,15 @@ class RemoteDisplay {
   uint16_t frameCount(uint8_t id) const;
   uint16_t frameWidth(uint8_t id) const { return hasAsset(id) ? _slots[id].fw : 0; }
   uint16_t frameHeight(uint8_t id) const { return hasAsset(id) ? _slots[id].fh : 0; }
+  bool isIndexed(uint8_t id) const { return hasAsset(id) && _slots[id].indexed; }
+  uint32_t assetBytes(uint8_t id) const;  // C6 pool space the asset uses
   // Free bytes in the C6 asset pool (asks the C6). Returns -1 if it does not answer.
   int32_t assetPoolFree();
 
   // Draws frame `frame` of an asset with its top-left at x,y. flags: RD_TRANSPARENT | RD_FLIP_X | RD_FLIP_Y
+  // Consecutive drawSprite() calls are sent to the C6 as one command (up to 127 sprites), so many sprites are cheap.
+  // setSpriteBatch(n): at most n sprites per command (1..127, 1 = one command per sprite).
+  void setSpriteBatch(uint8_t n);
   void drawSprite(uint8_t id, uint16_t frame, int16_t x, int16_t y, uint8_t flags = RD_TRANSPARENT);
   // Rotated (degrees, clockwise) and scaled; cx,cy is where the frame's center lands. Negative scale flips.
   void drawSpriteEx(uint8_t id, uint16_t frame, int16_t cx, int16_t cy, float angleDeg, float scaleX = 1.0f,
@@ -128,6 +141,19 @@ class RemoteDisplay {
   void pushImage(int16_t x, int16_t y, uint16_t w, uint16_t h, const uint16_t* pixels);
   // Copies a screen area (on the C6 framebuffer), e.g. to scroll.
   void copyRect(int16_t srcX, int16_t srcY, int16_t w, int16_t h, int16_t dstX, int16_t dstY);
+
+  // ---- tilemaps (milestone 6)
+  // A tilemap is a w x h grid of tile numbers (1 byte each, row-major) stored on the C6 under an asset id. Any
+  // image/sheet works as its tileset: tile number n is frame n of the sheet; RD_TILE_EMPTY is never drawn.
+  // Keep `tiles` alive: setTile() writes into it and restore() re-sends it.
+  bool uploadTilemap(uint8_t id, uint8_t* tiles, uint16_t w, uint16_t h);
+  void setTile(uint8_t mapId, uint16_t tx, uint16_t ty, uint8_t tile);
+  uint8_t getTile(uint8_t mapId, uint16_t tx, uint16_t ty) const;
+  // Fills the screen rectangle x,y,w,h with the map; map pixel (scrollX, scrollY) lands at the rectangle's
+  // top-left. flags: RD_TRANSPARENT (tile pixels of the tileset's transparent color are skipped), RD_WRAP.
+  // Without RD_WRAP, areas outside the map are left as they are.
+  void drawTilemap(uint8_t mapId, uint8_t tilesetId, int16_t scrollX, int16_t scrollY, int16_t x = 0, int16_t y = 0,
+                   int16_t w = SD_SCREEN_W, int16_t h = SD_SCREEN_H, uint8_t flags = 0);
 
   // After wasReset(): begin() again and re-upload every asset (from the SD card or RAM). Then redraw.
   bool restore();
@@ -179,20 +205,39 @@ class RemoteDisplay {
   bool restoreWithTimeout(uint32_t helloTimeoutMs);
   uint32_t doneCount() const { return _link.framesDone + _forgiven; }
   void flushPixels();
+  void flushBlits();
+  void flushPending() {
+    if (_pxCount) flushPixels();
+    if (_blitCount) flushBlits();
+  }
   void sendStyleIfNeeded();
   void sendText(uint8_t c, const uint8_t* prefix, uint16_t prefixLen, const char* s);
   uint8_t cmdSeq(uint8_t c, const uint8_t* p, uint16_t n);
   bool waitAck(uint8_t seq, uint32_t timeoutMs);
-  bool sendAsset(uint8_t id, const uint16_t* px, uint16_t w, uint16_t h, uint16_t fw, uint16_t fh, uint16_t key);
-  bool loadFile(uint8_t id, const char* path, uint16_t fw, uint16_t fh, uint16_t key);
+  bool sendAsset(uint8_t id, const uint16_t* px, uint16_t w, uint16_t h, uint16_t fw, uint16_t fh, uint16_t key,
+                 uint8_t format);
+  bool sendTilemap(uint8_t id, uint8_t* tiles, uint16_t w, uint16_t h);
+  bool beginUpload(const uint8_t* hdr, uint16_t n);
+  void dataPut(const uint8_t* bytes, uint32_t n);
+  bool endUpload();
+  bool loadFile(uint8_t id, const char* path, uint16_t fw, uint16_t fh, uint16_t key, uint8_t format);
   static const char* errName(uint8_t e);
 
   struct Slot {
     bool used = false;
     const uint16_t* mem = nullptr;  // uploaded from RAM
     char path[64] = "";             // or loaded from the SD card
+    uint8_t* map = nullptr;         // or a tilemap (the app's array)
     uint16_t w = 0, h = 0, fw = 0, fh = 0, key = 0;
+    uint8_t format = RD_FORMAT_AUTO;  // requested format (for restore)
+    bool indexed = false;             // stored with a palette
+    uint16_t palCount = 0;
   };
+  uint8_t _imageFormat = RD_FORMAT_AUTO;
+  // upload stream
+  uint8_t _upId = 0;
+  uint32_t _upStart = 0;
+  uint16_t _upFill = 0;
   Slot _slots[SD_MAX_ASSETS];
   uint8_t _rotation = 1;
   char _errBuf[96];
@@ -210,6 +255,12 @@ class RemoteDisplay {
   // pixel batch: color + up to 255 points
   uint8_t _px[2 + 255 * 4];
   uint16_t _pxCount = 0, _pxColor = 0;
+
+  // sprite batch: consecutive drawSprite() calls (BLIT payloads, 8 bytes each)
+  static const int BLIT_MAX = SD_MAX_PAYLOAD / 8;  // 128 would fill the payload exactly; keep it below
+  uint8_t _blit[(BLIT_MAX - 1) * 8];
+  uint16_t _blitCount = 0;
+  uint8_t _blitLimit = BLIT_MAX - 1;  // setSpriteBatch()
 
   // health
   bool _connected = false, _inRecovery = false, _redrawPending = false, _fullNext = false, _resetFlag = false;

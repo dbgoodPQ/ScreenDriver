@@ -37,7 +37,7 @@ static bool imageInfo(File& f, bool& png, int32_t& w, int32_t& h) {
   return false;
 }
 
-bool RemoteDisplay::loadFile(uint8_t id, const char* path, uint16_t fw, uint16_t fh, uint16_t key) {
+bool RemoteDisplay::loadFile(uint8_t id, const char* path, uint16_t fw, uint16_t fh, uint16_t key, uint8_t format) {
   if (strlen(path) >= sizeof(_slots[0].path)) {
     _err = "path too long (63 characters max)";
     return false;
@@ -85,7 +85,7 @@ bool RemoteDisplay::loadFile(uint8_t id, const char* path, uint16_t fw, uint16_t
   uint16_t* px = (uint16_t*)spr.getBuffer();
   for (int32_t i = 0; i < w * h; ++i) px[i] = __builtin_bswap16(px[i]);
 
-  ok = sendAsset(id, px, w, h, fw, fh, key);
+  ok = sendAsset(id, px, w, h, fw, fh, key, format);
   spr.deleteSprite();
   if (!ok) return false;
   _slots[id].mem = nullptr;  // the pixels are gone: restore() reloads from the file
@@ -94,9 +94,9 @@ bool RemoteDisplay::loadFile(uint8_t id, const char* path, uint16_t fw, uint16_t
 }
 
 bool RemoteDisplay::loadImage(uint8_t id, const char* path, uint16_t transparent) {
-  return loadFile(id, path, 0, 0, transparent);
+  return loadFile(id, path, 0, 0, transparent, _imageFormat);
 }
 
 bool RemoteDisplay::loadSheet(uint8_t id, const char* path, uint16_t frameW, uint16_t frameH, uint16_t transparent) {
-  return loadFile(id, path, frameW, frameH, transparent);
+  return loadFile(id, path, frameW, frameH, transparent, _imageFormat);
 }

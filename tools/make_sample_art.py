@@ -8,6 +8,8 @@ Writes:
   slime.png  64x16   sheet: 4 frames of 16x16, a bouncing slime facing right (PNG transparency)
   ship.png   32x32   a small spaceship pointing up (PNG transparency)
   ball.bmp   16x16   24-bit BMP, magenta (#FF00FF) = transparent
+  tiles.png  128x16  tileset: 8 tiles of 16x16 for the tilemap demo
+             0 sky, 1 grass, 2 dirt, 3 brick, 4 stone, 5 water, 6 cloud, 7 flower
 Copy the folder to the SD card as /screendriver/.
 """
 import math
@@ -75,5 +77,45 @@ d = ImageDraw.Draw(ball)
 d.ellipse([1, 1, 14, 14], fill=(220, 40, 40), outline=(120, 10, 10))
 d.ellipse([4, 3, 7, 6], fill=(255, 190, 190))
 ball.save(os.path.join(out, "ball.bmp"))
+
+# ---- tiles: 8 opaque 16x16 tiles (few colors each, so the sheet stays a palette image)
+SKY = (110, 170, 240)
+tiles = Image.new("RGB", (128, 16), SKY)
+d = ImageDraw.Draw(tiles)
+def T(i):
+    return i * 16
+# 1 grass: dirt with a green top
+d.rectangle([T(1), 0, T(1) + 15, 15], fill=(130, 85, 45))
+d.rectangle([T(1), 0, T(1) + 15, 4], fill=(70, 170, 60))
+for x in range(0, 16, 3):
+    d.point((T(1) + x, 5), fill=(70, 170, 60))
+# 2 dirt with pebbles
+d.rectangle([T(2), 0, T(2) + 15, 15], fill=(130, 85, 45))
+for (x, y) in [(3, 4), (10, 2), (7, 10), (13, 12), (1, 13)]:
+    d.rectangle([T(2) + x, y, T(2) + x + 1, y + 1], fill=(95, 60, 30))
+# 3 brick
+d.rectangle([T(3), 0, T(3) + 15, 15], fill=(180, 70, 50))
+for y in (0, 8):
+    d.line([(T(3), y), (T(3) + 15, y)], fill=(90, 35, 25))
+for (x, y0) in [(7, 0), (3, 8), (11, 8)]:
+    d.line([(T(3) + x, y0), (T(3) + x, y0 + 7)], fill=(90, 35, 25))
+# 4 stone
+d.rectangle([T(4), 0, T(4) + 15, 15], fill=(110, 110, 120))
+d.line([(T(4), 0), (T(4) + 15, 0)], fill=(150, 150, 160))
+d.line([(T(4), 0), (T(4), 15)], fill=(150, 150, 160))
+d.line([(T(4) + 15, 0), (T(4) + 15, 15)], fill=(70, 70, 80))
+d.line([(T(4), 15), (T(4) + 15, 15)], fill=(70, 70, 80))
+# 5 water with a wave line
+d.rectangle([T(5), 0, T(5) + 15, 15], fill=(40, 90, 200))
+for x in range(16):
+    d.point((T(5) + x, 2 + (x // 4) % 2), fill=(150, 200, 255))
+# 6 cloud on sky
+d.ellipse([T(6) + 1, 5, T(6) + 9, 13], fill=(250, 250, 250))
+d.ellipse([T(6) + 5, 2, T(6) + 14, 12], fill=(250, 250, 250))
+# 7 flower on sky
+d.line([(T(7) + 8, 7), (T(7) + 8, 15)], fill=(60, 150, 50))
+d.ellipse([T(7) + 5, 2, T(7) + 11, 8], fill=(240, 90, 160))
+d.point((T(7) + 8, 5), fill=(255, 230, 80))
+tiles.save(os.path.join(out, "tiles.png"))
 
 print("written to", os.path.abspath(out))

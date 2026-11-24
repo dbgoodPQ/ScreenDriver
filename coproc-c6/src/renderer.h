@@ -1,4 +1,4 @@
-// ScreenDriver C6 renderer (milestones 3-4: primitives, text, sprites).
+// ScreenDriver C6 renderer (milestones 3-6: primitives, text, sprites, palette images, tilemaps).
 // Executes drawing commands into the 320x240 framebuffer sprite and tracks the changed areas.
 // END_FRAME flushes only those areas to the ILI9341 (or the whole screen when most of it changed).
 #pragma once
@@ -94,7 +94,7 @@ class Renderer {
   // True for the opcodes handled here (drawing state, primitives, text).
   static bool handles(uint8_t cmd) {
     return (cmd >= SD_SET_CLIP && cmd <= SD_SET_CURSOR) || (cmd >= SD_FILL_SCREEN && cmd <= SD_DRAW_PIXELS) ||
-           cmd == SD_DRAW_TEXT || cmd == SD_PRINT || (cmd >= SD_BLIT && cmd <= SD_BLIT_EX) || cmd == SD_COPY_RECT;
+           cmd == SD_DRAW_TEXT || cmd == SD_PRINT || (cmd >= SD_BLIT && cmd <= SD_DRAW_TILEMAP) || cmd == SD_COPY_RECT;
   }
 
   // Executes one command. Returns SD_ERR_NONE or an error code for a NACK.
@@ -161,11 +161,105 @@ class Renderer {
     mark(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
   }
 
+  // Draws frame f of an image asset (RGB565 or INDEXED) with its top-left at x,y. flags: SD_BLIT_*.
+  // markDirty = false when the caller marks a larger area itself (tilemaps).
+  uint8_t drawFrame(const Asset* a, uint16_t f, int x, int y, uint8_t fl, bool markDirty = true) {
+    if (f >= a->frames) return SD_ERR_BAD_ARG;
+    const uint8_t* pool = _assets->pool();
+    bool key = fl & SD_BLIT_TRANSPARENT, fx = fl & SD_BLIT_FLIP_X, fy = fl & SD_BLIT_FLIP_Y;
+    if (a->fmt == SD_FMT_RGB565)
+      blit((const uint16_t*)a->frame(pool, f), a->fw, a->fh, x, y, key, a->key, fx, fy, markDirty);
+    else if (a->fmt == SD_FMT_INDEXED)
+      blitIdx(a->frame(pool, f), a->palette(pool), a->fw, a->fh, x, y, key && a->key < 256 ? a->key : -1, fx, fy,
+              markDirty);
+    else
+      return SD_ERR_BAD_ASSET;  // a tilemap is not an image
+    return SD_ERR_NONE;
+  }
+
+ public:  // public so the selftest can time it alone
+  // One opaque, unflipped row of palette pixels: the common case (tiles). Writes two pixels per 32-bit store,
+  // unrolled 8 wide (1.5x the plain loop; measured with the selftest).
+  static IRAM_ATTR void idxRow(uint16_t* d, const uint8_t* s, const uint16_t* pal, int w) {
+    if (((uintptr_t)d & 2) && w > 0) {  // align the destination to 4 bytes
+      *d++ = pal[*s++];
+      --w;
+    }
+    uint32_t* d32 = (uint32_t*)d;
+    for (; w >= 8; w -= 8, s += 8, d32 += 4) {
+      uint32_t a = pal[s[0]], b = pal[s[1]], c = pal[s[2]], e = pal[s[3]];
+      uint32_t f = pal[s[4]], g = pal[s[5]], h = pal[s[6]], k = pal[s[7]];
+      d32[0] = a | (b << 16);
+      d32[1] = c | (e << 16);
+      d32[2] = f | (g << 16);
+      d32[3] = h | (k << 16);
+    }
+    for (; w >= 2; w -= 2, s += 2) *d32++ = pal[s[0]] | ((uint32_t)pal[s[1]] << 16);
+    if (w) *(uint16_t*)d32 = pal[*s];
+  }
+
+ private:
+  // The same with a transparent palette index, unrolled 4 wide
+  static IRAM_ATTR void idxRowKey(uint16_t* d, const uint8_t* s, const uint16_t* pal, int w, int key) {
+    for (; w >= 4; w -= 4, s += 4, d += 4) {
+      int a = s[0], b = s[1], c = s[2], e = s[3];
+      if (a != key) d[0] = pal[a];
+      if (b != key) d[1] = pal[b];
+      if (c != key) d[2] = pal[c];
+      if (e != key) d[3] = pal[e];
+    }
+    for (; w > 0; --w, ++s, ++d)
+      if (*s != key) *d = pal[*s];
+  }
+
+  // A 16-bit row with a transparent color, unrolled 4 wide
+  static IRAM_ATTR void row565Key(uint16_t* d, const uint16_t* s, int w, uint16_t key) {
+    for (; w >= 4; w -= 4, s += 4, d += 4) {
+      uint16_t a = s[0], b = s[1], c = s[2], e = s[3];
+      if (a != key) d[0] = a;
+      if (b != key) d[1] = b;
+      if (c != key) d[2] = c;
+      if (e != key) d[3] = e;
+    }
+    for (; w > 0; --w, ++s, ++d)
+      if (*s != key) *d = *s;
+  }
+
+  // Same as blit() for an 8-bit palette image: key is the transparent palette index, -1 for none.
+  IRAM_ATTR void blitIdx(const uint8_t* src, const uint16_t* pal, int sw, int sh, int x, int y, int key, bool fx,
+                         bool fy, bool markDirty) {
+    int x0 = max(x, (int)_clip.x), y0 = max(y, (int)_clip.y);
+    int x1 = min(x + sw, _clip.x + _clip.w), y1 = min(y + sh, _clip.y + _clip.h);
+    if (x1 <= x0 || y1 <= y0) return;
+    const int w = x1 - x0, sx0 = x0 - x;
+    const int stepS = fy ? -sw : sw;
+    const uint8_t* srow = src + (fy ? sh - 1 - (y0 - y) : (y0 - y)) * sw;
+    uint16_t* drow = (uint16_t*)_fb->getBuffer() + y0 * SD_SCREEN_W + x0;
+    for (int row = y0; row < y1; ++row, srow += stepS, drow += SD_SCREEN_W) {
+      if (!fx) {
+        const uint8_t* s = srow + sx0;
+        if (key < 0) idxRow(drow, s, pal, w);
+        else idxRowKey(drow, s, pal, w, key);
+      } else {
+        const uint8_t* s = srow + (sw - 1 - sx0);  // walks backwards
+        if (key < 0) {
+          for (int i = 0; i < w; ++i) drow[i] = pal[s[-i]];
+        } else {
+          for (int i = 0; i < w; ++i) {
+            int c = s[-i];
+            if (c != key) drow[i] = pal[c];
+          }
+        }
+      }
+    }
+    if (markDirty) _dirty.add({(int16_t)x0, (int16_t)y0, (int16_t)w, (int16_t)(y1 - y0)});
+  }
+
   // Copies a w x h image (panel byte order) into the framebuffer at x,y, honoring the clip rectangle.
   // Optional transparent key and flips. Much faster than LovyanGFX's generic path for small sprites.
   // Runs from RAM (IRAM_ATTR) so its speed doesn't depend on the flash cache; one tight loop per case.
   IRAM_ATTR void blit(const uint16_t* src, int sw, int sh, int x, int y, bool useKey, uint16_t key, bool fx,
-                      bool fy) {
+                      bool fy, bool markDirty) {
     int x0 = max(x, (int)_clip.x), y0 = max(y, (int)_clip.y);
     int x1 = min(x + sw, _clip.x + _clip.w), y1 = min(y + sh, _clip.y + _clip.h);
     if (x1 <= x0 || y1 <= y0) return;
@@ -176,14 +270,8 @@ class Renderer {
     for (int row = y0; row < y1; ++row, srow += stepS, drow += SD_SCREEN_W) {
       if (!fx) {
         const uint16_t* s = srow + sx0;
-        if (!useKey) {
-          memcpy(drow, s, w * 2);
-        } else {
-          for (int i = 0; i < w; ++i) {
-            uint16_t c = s[i];
-            if (c != key) drow[i] = c;
-          }
-        }
+        if (!useKey) memcpy(drow, s, w * 2);
+        else row565Key(drow, s, w, key);
       } else {
         const uint16_t* s = srow + (sw - 1 - sx0);  // walks backwards
         if (!useKey) {
@@ -196,7 +284,47 @@ class Renderer {
         }
       }
     }
-    _dirty.add({(int16_t)x0, (int16_t)y0, (int16_t)w, (int16_t)(y1 - y0)});
+    if (markDirty) _dirty.add({(int16_t)x0, (int16_t)y0, (int16_t)w, (int16_t)(y1 - y0)});
+  }
+
+  static int floorDiv(int a, int b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }
+  static int mod(int a, int b) {
+    int r = a % b;
+    return r < 0 ? r + b : r;
+  }
+
+  // DRAW_TILEMAP: fills the screen rectangle rx,ry,rw,rh with the map's tiles, the map pixel (sx, sy) landing
+  // at the rectangle's top-left. Outside the map nothing is drawn, unless wrap repeats it.
+  uint8_t drawTilemap(const Asset* m, const Asset* ts, int sx, int sy, int rx, int ry, int rw, int rh, uint8_t fl) {
+    int x0 = max(rx, (int)_clip.x), y0 = max(ry, (int)_clip.y);
+    int x1 = min(rx + rw, _clip.x + _clip.w), y1 = min(ry + rh, _clip.y + _clip.h);
+    if (x1 <= x0 || y1 <= y0) return SD_ERR_NONE;
+    const int tw = ts->fw, th = ts->fh;
+    const bool wrap = fl & SD_TILEMAP_WRAP;
+    // map pixel at screen (x0, y0)
+    int wx = sx + (x0 - rx), wy = sy + (y0 - ry);
+    const DRect saved = _clip;
+    _clip = {(int16_t)x0, (int16_t)y0, (int16_t)(x1 - x0), (int16_t)(y1 - y0)};
+    const uint8_t tileFlags = fl & SD_BLIT_TRANSPARENT;
+    int tx0 = floorDiv(wx, tw), ty0 = floorDiv(wy, th);
+    int px0 = x0 - (wx - tx0 * tw), py = y0 - (wy - ty0 * th);
+    const uint8_t* map = m->frame(_assets->pool(), 0);
+    for (int ty = ty0; py < y1; ++ty, py += th) {
+      int my = wrap ? mod(ty, m->h) : ty;
+      if (my < 0 || my >= m->h) continue;
+      const uint8_t* row = map + my * m->w;
+      int px = px0;
+      for (int tx = tx0; px < x1; ++tx, px += tw) {
+        int mx = wrap ? mod(tx, m->w) : tx;
+        if (mx < 0 || mx >= m->w) continue;
+        uint8_t t = row[mx];
+        if (t == SD_TILE_EMPTY || t >= ts->frames) continue;
+        drawFrame(ts, t, px, py, tileFlags, false);
+      }
+    }
+    _clip = saved;
+    _dirty.add({(int16_t)x0, (int16_t)y0, (int16_t)(x1 - x0), (int16_t)(y1 - y0)});
+    return SD_ERR_NONE;
   }
 
   bool setFont(uint8_t id) {
@@ -375,12 +503,26 @@ class Renderer {
         if (!need(8)) return SD_ERR_BAD_LEN;
         const Asset* a = _assets->get(p[0]);
         if (!a) return SD_ERR_BAD_ASSET;
-        uint16_t f = sd_rd_u16(p + 1);
-        if (f >= a->frames) return SD_ERR_BAD_ARG;
-        uint8_t fl = p[7];
-        blit(a->frame(_assets->pool(), f), a->fw, a->fh, i16(p + 3), i16(p + 5), fl & SD_BLIT_TRANSPARENT, a->key,
-             fl & SD_BLIT_FLIP_X, fl & SD_BLIT_FLIP_Y);
-        return SD_ERR_NONE;
+        return drawFrame(a, sd_rd_u16(p + 1), i16(p + 3), i16(p + 5), p[7]);
+      }
+      case SD_BLIT_BATCH: {
+        // n x BLIT payload. All entries are drawn; the first error (if any) is reported.
+        if (!n || n % 8) return SD_ERR_BAD_LEN;
+        uint8_t err = SD_ERR_NONE;
+        for (const uint8_t* e = p; e < p + n; e += 8) {
+          const Asset* a = _assets->get(e[0]);
+          uint8_t r = a ? drawFrame(a, sd_rd_u16(e + 1), i16(e + 3), i16(e + 5), e[7]) : SD_ERR_BAD_ASSET;
+          if (r && !err) err = r;
+        }
+        return err;
+      }
+      case SD_DRAW_TILEMAP: {
+        // u8 map, u8 tileset, i16 scroll_x, scroll_y, i16 x, y, w, h (screen rectangle), u8 flags
+        if (!need(15)) return SD_ERR_BAD_LEN;
+        const Asset* m = _assets->get(p[0]);
+        const Asset* ts = _assets->get(p[1]);
+        if (!m || m->fmt != SD_FMT_TILEMAP || !ts || ts->fmt == SD_FMT_TILEMAP) return SD_ERR_BAD_ASSET;
+        return drawTilemap(m, ts, i16(p + 2), i16(p + 4), i16(p + 6), i16(p + 8), i16(p + 10), i16(p + 12), p[14]);
       }
       case SD_BLIT_EX: {
         // u8 id, u16 frame, i16 cx, cy (where the frame's center lands), i16 angle (0.1 deg),
@@ -393,12 +535,25 @@ class Renderer {
         int cx = i16(p + 3), cy = i16(p + 5);
         float ang = i16(p + 7) / 10.0f, zx = i16(p + 9) / 256.0f, zy = i16(p + 11) / 256.0f;
         if (zx == 0 || zy == 0) return SD_ERR_NONE;
-        const uint16_t* d = a->frame(_assets->pool(), f);
-        if (p[13] & SD_BLIT_TRANSPARENT)
-          _fb->pushImageRotateZoom((float)cx, (float)cy, a->fw / 2.0f, a->fh / 2.0f, ang, zx, zy, a->fw, a->fh, d,
-                                   (uint16_t)a->key);
-        else
-          _fb->pushImageRotateZoom((float)cx, (float)cy, a->fw / 2.0f, a->fh / 2.0f, ang, zx, zy, a->fw, a->fh, d);
+        if (a->fmt == SD_FMT_TILEMAP) return SD_ERR_BAD_ASSET;
+        const uint8_t* pool = _assets->pool();
+        const float fcx = cx, fcy = cy, hx = a->fw / 2.0f, hy = a->fh / 2.0f;
+        bool key = p[13] & SD_BLIT_TRANSPARENT;
+        if (a->fmt == SD_FMT_INDEXED) {
+          const lgfx::swap565_t* pal = (const lgfx::swap565_t*)a->palette(pool);
+          const uint8_t* d = a->frame(pool, f);
+          if (key && a->key < 256)
+            _fb->pushImageRotateZoom(fcx, fcy, hx, hy, ang, zx, zy, a->fw, a->fh, d, (uint32_t)a->key,
+                                     lgfx::palette_8bit, pal);
+          else
+            _fb->pushImageRotateZoom(fcx, fcy, hx, hy, ang, zx, zy, a->fw, a->fh, d, lgfx::palette_8bit, pal);
+        } else {
+          const uint16_t* d = (const uint16_t*)a->frame(pool, f);
+          if (key)
+            _fb->pushImageRotateZoom(fcx, fcy, hx, hy, ang, zx, zy, a->fw, a->fh, d, (uint16_t)a->key);
+          else
+            _fb->pushImageRotateZoom(fcx, fcy, hx, hy, ang, zx, zy, a->fw, a->fh, d);
+        }
         // Bounding box of the rotated, scaled frame
         float r = ang * (float)PI / 180.0f, c = fabsf(cosf(r)), s = fabsf(sinf(r));
         float hw = a->fw * fabsf(zx) / 2, hh = a->fh * fabsf(zy) / 2;

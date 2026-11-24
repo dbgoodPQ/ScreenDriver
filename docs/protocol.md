@@ -145,21 +145,30 @@ middle 4 / 5 / 6, bottom 8 / 9 / 10, baseline 16 / 17 / 18 (so `MC_DATUM` = 5).
 
 ### Assets (0x50–0x5F)
 
-Assets are images (sprites or sprite sheets) stored in C6 RAM and referenced by `id`
+Assets are images (sprites or sprite sheets) and tilemaps stored in C6 RAM and referenced by `id`
 (0–63). The pool is 160 KB (HELLO and STATUS report the free bytes). Freeing an asset compacts the
 pool, so it never fragments.
 
 | Op | Name | Payload |
 |---|---|---|
-| 0x50 | ASSET_BEGIN **(reply ACK/NACK)** | `u8 id`, `u8 format`, `u16 w, h`, `u16 frame_w, frame_h`, `color transparent` |
+| 0x50 | ASSET_BEGIN **(reply ACK/NACK)** | `u8 id`, `u8 format`, `u16 w, h`, `u16 frame_w, frame_h`, `u16 transparent`, [`u16 palette_count`: INDEXED only] |
 | 0x51 | ASSET_DATA | `u8 id`, `u32 offset`, raw bytes (NACK only on error) |
 | 0x52 | ASSET_END **(reply ACK/NACK)** | `u8 id` |
 | 0x53 | ASSET_FREE | `u8 id` (0xFF = free all; NACK only on error) |
+| 0x54 | TILE_SET | `u8 map`, `u16 tx, ty`, tile bytes: written from (tx, ty) along the row, continuing on the next rows (NACK only on error) |
 
-- `format` is 0 = RGB565. Others are reserved: 1 = 8-bit indexed, 2 = RLE RGB565.
+- `format`:
+
+  | Value | Format | Stored size | `transparent` | ASSET_DATA stream |
+  |---|---|---|---|---|
+  | 0 | RGB565 | w·h·2 | the transparent color | pixels, RGB565 little-endian |
+  | 1 | INDEXED (fw 0600) | count·2 + w·h | a palette index; > 255 = none | the palette (`count` × RGB565 LE), then 1 index byte per pixel |
+  | 2 | TILEMAP (fw 0600) | w·h | ignored | tile numbers, 1 byte each, row-major (`w, h` in tiles; `frame_w/h` ignored) |
+
+  Sizes are rounded up to 4 bytes. The host library picks INDEXED by itself for images with ≤ 256 colors.
 - A sprite sheet is a `w × h` image split into `frame_w × frame_h` cells, numbered
   row-major from 0. `frame_w`/`frame_h` = 0 means one frame of the whole image.
-- ASSET_DATA carries the pixels as RGB565 little-endian **in frame order**: all of frame 0 (row by row),
+- ASSET_DATA carries the pixels **in frame order**: all of frame 0 (row by row),
   then frame 1, and so on. The host library reorders the sheet before sending. `offset` is in bytes.
 - ASSET_BEGIN is refused with `ERR_NO_MEM` if the asset does not fit, and replaces an existing asset with
   the same id. ASSET_END is refused with `ERR_BAD_ASSET` (and the asset freed) if bytes are missing.
@@ -171,8 +180,16 @@ pool, so it never fragments.
 | 0x60 | BLIT | `u8 id`, `u16 frame`, `i16 x, y`, `u8 flags` (bit0 = use transparent key, bit1 = flip X, bit2 = flip Y) |
 | 0x61 | BLIT_INLINE | `i16 x, y`, `u16 w, h`, `u8 format`, pixel data (RGB565 LE, row-major; must fit in one frame) |
 | 0x62 | BLIT_EX | `u8 id`, `u16 frame`, `i16 cx, cy` (where the frame's center lands), `i16 angle` (0.1°, clockwise), `i16 scale_x, scale_y` (256 = 1.0, negative = flip), `u8 flags` (bit0 = transparent) |
+| 0x63 | BLIT_BATCH (fw 0600) | 1–127 BLIT payloads (8 bytes each) back to back |
+| 0x64 | DRAW_TILEMAP (fw 0600) | `u8 map`, `u8 tileset`, `i16 scroll_x, scroll_y`, `i16 x, y, w, h` (screen rectangle), `u8 flags` (bit0 = transparent, bit3 = wrap) |
 
-BLIT on a missing asset gives `ERR_BAD_ASSET`, a frame out of range `ERR_BAD_ARG`.
+BLIT on a missing asset (or a tilemap) gives `ERR_BAD_ASSET`, a frame out of range `ERR_BAD_ARG`.
+BLIT_BATCH draws every entry and reports the first error, if any.
+
+DRAW_TILEMAP fills the rectangle with the map's tiles; map pixel (`scroll_x`, `scroll_y`) lands at the rectangle's
+top-left. Tile number *n* is frame *n* of the tileset (any image asset, RGB565 or INDEXED); tile 0xFF and numbers
+beyond the tileset's frames are not drawn. Without wrap, the parts of the rectangle outside the map are left
+unchanged; with wrap the map repeats in both directions. The whole rectangle is marked dirty.
 
 ### Misc (0x70–0x7F)
 

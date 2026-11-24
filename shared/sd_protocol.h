@@ -62,10 +62,13 @@ enum sd_cmd : uint8_t {
   SD_ASSET_DATA     = 0x51,
   SD_ASSET_END      = 0x52,
   SD_ASSET_FREE     = 0x53,
+  SD_TILE_SET       = 0x54,  // u8 map, u16 tx, ty, tile bytes (along the row, continuing on the next rows)
   // Blitting
   SD_BLIT           = 0x60,
   SD_BLIT_INLINE    = 0x61,
   SD_BLIT_EX        = 0x62,  // BLIT with rotation and scale (milestone 4)
+  SD_BLIT_BATCH     = 0x63,  // several BLIT payloads (8 bytes each) in one command (milestone 6)
+  SD_DRAW_TILEMAP   = 0x64,  // a tilemap layer into a screen rectangle (milestone 6)
   // Misc
   SD_COPY_RECT      = 0x70,
   // Replies (C6 -> host)
@@ -90,7 +93,8 @@ enum sd_error : uint8_t {
 
 enum sd_asset_format : uint8_t {
   SD_FMT_RGB565  = 0,
-  SD_FMT_INDEXED = 1,  // reserved
+  SD_FMT_INDEXED = 1,  // 8-bit palette image: palette (u16 count) + 1 byte per pixel (milestone 6)
+  SD_FMT_TILEMAP = 2,  // tilemap: w x h tile numbers, 1 byte each (milestone 6)
 };
 
 // Flag bits
@@ -100,6 +104,8 @@ enum sd_asset_format : uint8_t {
 #define SD_BLIT_TRANSPARENT  0x01
 #define SD_BLIT_FLIP_X       0x02
 #define SD_BLIT_FLIP_Y       0x04
+#define SD_TILEMAP_WRAP      0x08  // DRAW_TILEMAP: repeat the map in both directions
+#define SD_TILE_EMPTY        0xFF  // tile number that is never drawn
 
 // DEBUG_PINS actions (payload: u8 action)
 #define SD_PINS_RTS_LOW       0  // drive the C6 RTS pin (D9) LOW as a plain GPIO, flow control off

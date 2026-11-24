@@ -25,14 +25,13 @@ static bool loadAssets() {
       {A_BALL, "/screendriver/ball.bmp", 0, 0},
   };
   for (auto& e : list) {
-    uint32_t t0 = millis();
     bool ok = e.fw ? ext.loadSheet(e.id, e.path, e.fw, e.fh) : ext.loadImage(e.id, e.path);
     if (!ok) {
       localLog(TFT_RED, "%s: %s", e.path + 14, ext.lastError());
       return false;
     }
-    localLog(TFT_GREEN, "%-10s %dx%d x%d  %lu ms", e.path + 14, ext.frameWidth(e.id), ext.frameHeight(e.id),
-             ext.frameCount(e.id), (unsigned long)(millis() - t0));
+    localLog(TFT_GREEN, "%-9s %dx%d x%d %s %luB", e.path + 14, ext.frameWidth(e.id), ext.frameHeight(e.id),
+             ext.frameCount(e.id), ext.isIndexed(e.id) ? "pal" : "565", (unsigned long)ext.assetBytes(e.id));
   }
   localLog(TFT_WHITE, "C6 pool free: %ld bytes", (long)ext.assetPoolFree());
   return true;

@@ -160,6 +160,10 @@ connects by itself when the C6 appears. `examples/extscreen_app` is a complete, 
 of using the screen: a second screen with its own content, and a mirror of the Cardputer screen. The link uses
 G13, G15, G4, G6 and UART1, so the app must not use them.
 
+An app without M5GFX (for example one built on Arduino_GFX) adds `-DRD_NO_FILE_IMAGES`: the PNG/BMP loader
+and its SD mount are left out, `loadImage`/`loadSheet` return false, and images come from RAM with
+`uploadImage`.
+
 ### Frames
 
 - Nothing reaches the panel until `endFrame()`. It blocks until the previous frame is done (at most one

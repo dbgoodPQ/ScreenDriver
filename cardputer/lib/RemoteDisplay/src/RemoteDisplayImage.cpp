@@ -1,9 +1,19 @@
 // RemoteDisplay: loading PNG/BMP images from the Cardputer-ADV's SD card.
+#include "RemoteDisplay.h"
+
+#if defined(RD_NO_FILE_IMAGES)
+// Apps without M5GFX (or with their own SD setup) build with -DRD_NO_FILE_IMAGES: images come
+// only from RAM (uploadImage), and loadImage/loadSheet fail.
+bool RemoteDisplay::mountSD() { return false; }
+bool RemoteDisplay::loadFile(uint8_t, const char*, uint16_t, uint16_t, uint16_t, uint8_t) {
+  snprintf(_errBuf, sizeof _errBuf, "image files disabled (RD_NO_FILE_IMAGES)");
+  return false;
+}
+#else
 // SD.h must come before M5GFX.h so that M5GFX enables its file-based image decoders.
 #include <SPI.h>
 #include <SD.h>
 #include <M5GFX.h>
-#include "RemoteDisplay.h"
 
 // Cardputer-ADV microSD (SPI): not shared with the link pins
 #define RD_SD_SCK  40
@@ -92,6 +102,7 @@ bool RemoteDisplay::loadFile(uint8_t id, const char* path, uint16_t fw, uint16_t
   strcpy(_slots[id].path, path);
   return true;
 }
+#endif  // RD_NO_FILE_IMAGES
 
 bool RemoteDisplay::loadImage(uint8_t id, const char* path, uint16_t transparent) {
   return loadFile(id, path, 0, 0, transparent, _imageFormat);

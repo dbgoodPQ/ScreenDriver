@@ -4,6 +4,7 @@
 #pragma once
 #include <string.h>
 #include "sd_protocol.h"
+#include "esp_idf_version.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
@@ -105,8 +106,11 @@ class SdUartPort {
   uint32_t backpressure = 0;    // ring buffer full: flow control held the sender (no data loss)
   uint32_t lineErrors = 0;      // framing or parity errors (noise or baud mismatch)
 
+#if ESP_IDF_VERSION_MAJOR >= 5
   // Pin state found by begin() before it reset the input pins (oe = 1 means something was driving it)
+  // (ESP-IDF 5 only: gpio_get_io_config() does not exist in IDF 4.4 / Arduino core 2.x)
   gpio_io_config_t ctsPinBefore = {}, rxPinBefore = {};
+#endif
 
   bool begin(uart_port_t port, int txPin, int rxPin, int rtsPin, int ctsPin, int baud,
              int rxBufSize = 16384, int txBufSize = 8192) {
@@ -120,14 +124,20 @@ class SdUartPort {
     cfg.stop_bits = UART_STOP_BITS_1;
     cfg.flow_ctrl = UART_HW_FLOWCTRL_CTS_RTS;
     cfg.rx_flow_ctrl_thresh = 100;  // RTS deasserts when the 128-byte HW FIFO holds > 100 bytes
+#if ESP_IDF_VERSION_MAJOR >= 5
     cfg.source_clk = UART_SCLK_DEFAULT;
+#else
+    cfg.source_clk = UART_SCLK_APB;   // IDF 4.4 (Arduino core 2.x) name of the default clock
+#endif
     if (uart_driver_install(_port, rxBufSize, txBufSize, 512, &_events, 0) != ESP_OK) return false;
     if (uart_param_config(_port, &cfg) != ESP_OK) return false;
     // Another library (e.g. M5 board auto-detection) may have left our input pins driven as outputs or
     // attached to another peripheral. uart_set_pin() does not turn such an output off, so the pin would
     // fight the other side's driver (seen on Cardputer-ADV G6). Record the state for diagnostics, then reset.
+#if ESP_IDF_VERSION_MAJOR >= 5
     if (ctsPin >= 0) gpio_get_io_config((gpio_num_t)ctsPin, &ctsPinBefore);
     gpio_get_io_config((gpio_num_t)rxPin, &rxPinBefore);
+#endif
     gpio_reset_pin((gpio_num_t)rxPin);
     if (ctsPin >= 0) gpio_reset_pin((gpio_num_t)ctsPin);
     if (uart_set_pin(_port, txPin, rxPin, rtsPin, ctsPin) != ESP_OK) return false;

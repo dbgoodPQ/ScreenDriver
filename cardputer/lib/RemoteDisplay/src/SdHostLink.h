@@ -10,6 +10,15 @@
 #define SD_HOST_PIN_CTS   6  // G6,  upper row 3rd <- C6 D9 (RTS)  (above 5VOUT: don't slip a row!)
 #define SD_HOST_UART     UART_NUM_1
 
+// UART driver ring buffers on the host. Apps that are short on heap (e.g. a launcher that needs ~40 KB
+// contiguous for a TLS handshake) can shrink them; a smaller TX buffer only makes big pushes block sooner.
+#ifndef SD_HOST_RX_BUF
+#define SD_HOST_RX_BUF 4096
+#endif
+#ifndef SD_HOST_TX_BUF
+#define SD_HOST_TX_BUF 16384
+#endif
+
 struct SdHelloInfo {
   uint8_t proto = 0;
   uint16_t fw = 0, width = 0, height = 0;

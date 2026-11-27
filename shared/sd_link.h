@@ -10,6 +10,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
+// UART driver event queue length. Events only feed the diagnostic counters (pollEvents()); reads don't use
+// them, so a short queue just undercounts when it fills. Each entry is a uart_event_t on the heap.
+#ifndef SD_LINK_EVENT_QUEUE
+#define SD_LINK_EVENT_QUEUE 512
+#endif
+
 // ---------------------------------------------------------------------------
 // Frame parser
 // ---------------------------------------------------------------------------
@@ -129,7 +135,7 @@ class SdUartPort {
 #else
     cfg.source_clk = UART_SCLK_APB;   // IDF 4.4 (Arduino core 2.x) name of the default clock
 #endif
-    if (uart_driver_install(_port, rxBufSize, txBufSize, 512, &_events, 0) != ESP_OK) return false;
+    if (uart_driver_install(_port, rxBufSize, txBufSize, SD_LINK_EVENT_QUEUE, &_events, 0) != ESP_OK) return false;
     if (uart_param_config(_port, &cfg) != ESP_OK) return false;
     // Another library (e.g. M5 board auto-detection) may have left our input pins driven as outputs or
     // attached to another peripheral. uart_set_pin() does not turn such an output off, so the pin would

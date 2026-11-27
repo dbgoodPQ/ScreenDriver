@@ -2,7 +2,7 @@
 
 bool SdHostLink::begin(int baud) {
   return _port.begin(SD_HOST_UART, SD_HOST_PIN_TX, SD_HOST_PIN_RX, SD_HOST_PIN_RTS, SD_HOST_PIN_CTS, baud,
-                     4096 /*rx*/, 16384 /*tx*/);
+                     SD_HOST_RX_BUF, SD_HOST_TX_BUF);
 }
 
 uint8_t SdHostLink::send(uint8_t cmd, const void* payload, uint16_t len) {
